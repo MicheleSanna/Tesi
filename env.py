@@ -1,6 +1,6 @@
 """
-Ambiente di reinforcement learning per la scena del labirinto (stessa interfaccia di gymnasium:
-reset() -> (obs, info), step(action) -> (obs, reward, terminated, truncated, info), close()).
+Ambiente gymnasium per la scena del labirinto:
+reset() -> (obs, info), step(action) -> (obs, reward, terminated, truncated, info), close().
 
 AZIONE (4 valori in [-1, 1], come ProbeController.set_command)
   [avanzamento, yaw, pitch, sollevamento]
@@ -17,7 +17,9 @@ USO
   python env.py                   -> un episodio con azioni casuali
 """
 
+import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
 from scipy.spatial.transform import Rotation as R
 
 import Sofa
@@ -31,25 +33,14 @@ GOAL = np.array([0.05, 0.51, 0.0]) * scene_maze.MESH_SCALE   # [m]
 MAX_STEPS = 500
 
 
-class Box:
-    """Versione minima di gymnasium.spaces.Box."""
+class MazeEnv(gym.Env):
+    metadata = {"render_modes": []}
 
-    def __init__(self, low, high, shape):
-        self.low = np.full(shape, low, dtype=np.float32)
-        self.high = np.full(shape, high, dtype=np.float32)
-        self.shape = shape
-        self.rng = np.random.default_rng()
-
-    def sample(self):
-        return self.rng.uniform(self.low, self.high).astype(np.float32)
-
-
-class MazeEnv:
     def __init__(self, goal=GOAL, max_steps=MAX_STEPS):
         self.goal = np.asarray(goal, dtype=float)
         self.max_steps = max_steps
-        self.action_space = Box(-1.0, 1.0, (4,))
-        self.observation_space = Box(-np.inf, np.inf, (12,))
+        self.action_space = spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32)
 
         self.root = Sofa.Core.Node("root")
         scene_maze.createScene(self.root, with_visual=False)
@@ -61,8 +52,9 @@ class MazeEnv:
         self.prev_y = 0.0
 
     def reset(self, seed=None, options=None):
+        super().reset(seed=seed)   # inizializza self.np_random
         if seed is not None:
-            self.action_space.rng = np.random.default_rng(seed)
+            self.action_space.seed(seed)
         Sofa.Simulation.reset(self.root)   # riporta labirinto, sonda e bersaglio allo stato iniziale
         self.steps = 0
         self.prev_y = self.ctrl.get_tip_pose()[1]
@@ -80,16 +72,21 @@ class MazeEnv:
 
         terminated = not np.all(np.isfinite(obs))   # simulazione divergente
         truncated = self.steps >= self.max_steps
-        return obs, reward, terminated, truncated, {}
+        return obs, float(reward), terminated, truncated, {}
 
     def close(self):
         Sofa.Simulation.unload(self.root)
 
     def _obs(self):
-        pose = self.ctrl.get_tip_pose()
-        force, torque = self.ctrl.get_coupling_load()
-        goal_rel = R.from_quat(pose[3:7]).inv().apply(self.goal - pose[0:3])
-        return np.concatenate([pose, [force, torque], goal_rel]).astype(np.float32)
+        return observation(self.ctrl, self.goal)
+
+
+def observation(ctrl, goal):
+    """Osservazione a 12 valori letta dal ProbeController (usata anche da view_agent.py)."""
+    pose = ctrl.get_tip_pose()
+    force, torque = ctrl.get_coupling_load()
+    goal_rel = R.from_quat(pose[3:7]).inv().apply(goal - pose[0:3])
+    return np.concatenate([pose, [force, torque], goal_rel]).astype(np.float32)
 
 
 if __name__ == "__main__":

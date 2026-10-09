@@ -15,22 +15,59 @@ import controller
 #                                             quasi identica alla fine, ~4x piu' veloce
 #   "coarse"  maze4.1_coarse.msh   488 nodi - la piu' veloce, materiale ~13% piu' rigido
 #   "ultra"   maze_ultra_complex.msh  31662 nodi - superficie esterna ondulata, stesso canale
-MESH_VARIANT = "fine"
+# Polmoni (tetra.py e genera_mesh.py polmoni):
+#   "polmoni"         polmoni3.0.msh         20773 nodi - uniforme
+#   "polmoni_graded"  polmoni3.0_graded.msh  13982 nodi - fine vicino a trachea e bronchi
+#   "polmoni_coarse"  polmoni3.0_coarse.msh   7954 nodi - come graded ma piu' grossolana,
+#                                             due fondi di bronco accorciati di ~0.3 unita'
+MESH_VARIANT = "polmoni_coarse"
 MESH_FILES = {"fine": "maze4.1.msh", "graded": "maze4.1_graded.msh", "coarse": "maze4.1_coarse.msh",
-              "ultra": "maze_ultra_complex.msh"}
+              "ultra": "maze_ultra_complex.msh", "polmoni": "polmoni3.0.msh",
+              "polmoni_graded": "polmoni3.0_graded.msh", "polmoni_coarse": "polmoni3.0_coarse.msh"}
 # percorso relativo a questo script, cosi' la scena si carica anche se runSofa viene lanciato
 # da un'altra cartella
 MESH_FILE = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"), MESH_FILES[MESH_VARIANT])
-# maze4.1 e' un cubo normalizzato in [-1, 1]^3 con un canale interno a sezione quadrata
-# (lato 0.112 unita' mesh) che entra al centro della faccia -Y e procede verso +Y nel piano z = 0.
-# Con MESH_SCALE = 0.05 il cubo e' largo 10 cm e il canale 5.6 mm.
-MESH_SCALE = 0.05             # fattore per portare la mesh in metri (0.001 se e' in mm)
 UP_AXIS = 2                   # asse verticale: 2 = Z (default di Blender), 1 = Y
+
+# Scala, rotazione e posa iniziale della sonda dipendono dalla mesh.
+# MESH_SCALE: fattore per portare la mesh in metri (0.001 se e' in mm)
+# MESH_ROTATION_DEG: rotazione della mesh attorno all'asse verticale, applicata al caricamento
+# Sonda scritta in unita' mesh * MESH_SCALE, cosi' resta coerente se cambi scala.
+# PROBE_RADIUS / PROBE_LENGTH / PROBE_START = None -> valore automatico proporzionale alla
+# dimensione della mesh (stampato a terminale)
+if os.path.basename(MESH_FILE).startswith("maze"):
+    # maze4.1 e' un cubo normalizzato in [-1, 1]^3 con un canale interno a sezione quadrata
+    # (lato 0.112 unita' mesh) che entra al centro della faccia -Y e procede verso +Y nel piano z = 0.
+    # Con MESH_SCALE = 0.05 il cubo e' largo 10 cm e il canale 5.6 mm.
+    MESH_SCALE = 0.05
+    MESH_ROTATION_DEG = 0.0
+    MESH_UPSIDE_DOWN = False
+    PROBE_RADIUS = 0.03 * MESH_SCALE   # [m] < meta' larghezza canale (0.056 unita' mesh)!
+    PROBE_LENGTH = 0.1 * MESH_SCALE    # [m]
+    PROBE_START = [0.0, -1.06 * MESH_SCALE, 0.0]  # [m] punta appena fuori dall'ingresso sulla faccia -Y
+else:
+    # polmoni3.0: la trachea e' un canale a sezione rettangolare lungo +X (prima della rotazione),
+    # largo 0.43 e alto 0.215 unita' mesh, con asse in y = 0, z ~ 0.318 e imboccatura a x ~ -4.55.
+    # La rotazione di 90 gradi porta l'imboccatura su -Y e la trachea lungo +Y, come il canale
+    # del labirinto (stessa convenzione per la sonda e per il reward +Y dell'ambiente RL).
+    # Scala: diametro della sonda = meta' del lato minore della trachea, con la sonda della stessa
+    # misura di quella del labirinto (diametro 3 mm) -> trachea 6 x 12 mm, polmoni ~25 cm.
+    # MESH_UPSIDE_DOWN capovolge il modello (rotazione di 180 gradi attorno all'asse della trachea,
+    # non uno specchio, che invertirebbe i tetraedri): la trachea passa da z ~ +0.318 a z ~ -0.318,
+    # nella meta' bassa del modello, e i due polmoni si scambiano di lato.
+    TRACHEA_SIZE = 0.215               # lato minore del canale della trachea [unita' mesh]
+    MESH_SCALE = 4 * 0.0015 / TRACHEA_SIZE
+    MESH_ROTATION_DEG = 90.0
+    MESH_UPSIDE_DOWN = True
+    PROBE_RADIUS = TRACHEA_SIZE / 4 * MESH_SCALE   # [m] diametro = meta' della trachea
+    PROBE_LENGTH = 0.1 * 0.05                      # [m] come nel labirinto
+    trachea_z = -0.318 if MESH_UPSIDE_DOWN else 0.318
+    PROBE_START = [0.0, -4.66 * MESH_SCALE, trachea_z * MESH_SCALE]  # [m] punta appena fuori dall'imboccatura
 
 YOUNG_MODULUS = 3.0e4         # [Pa] rigidezza del materiale (~silicone morbido)
 POISSON_RATIO = 0.45          # quasi incomprimibile, tipico dei tessuti
 DENSITY = 1000.0              # [kg/m^3]
-FIX_BOTTOM_FRACTION = 0.02    # vincola i nodi nel 2% piu' basso del labirinto (la "base")
+FIX_BOTTOM_FRACTION = 0.27   # vincola i nodi nel 2% piu' basso del labirinto (la "base")
 
 # Pressione uniforme e costante sulla superficie ESTERNA del labirinto (non sulle pareti del
 # canale), sempre perpendicolare alla superficie anche quando si deforma.
@@ -44,13 +81,9 @@ DT = 0.01                     # [s] time step
 #   "iterative" = CGLinearSolver + UncoupledConstraintCorrection: approssimato, molto piu' veloce
 LINEAR_SOLVER = "iterative"
 CG_ITERATIONS = 50            # solo per "iterative": iterazioni massime del gradiente coniugato
-USE_MULTITHREADING = False     # versioni parallele (plugin MultiThreading) di FEM e collisioni
+USE_MULTITHREADING = True     # versioni parallele (plugin MultiThreading) di FEM e collisioni
 
-# Sonda (scritta in unita' mesh * MESH_SCALE, cosi' resta coerente se cambi scala).
-# None = valore automatico proporzionale alla dimensione del labirinto (stampato a terminale)
-PROBE_RADIUS = 0.03 * MESH_SCALE   # [m] < meta' larghezza canale (0.056 unita' mesh)!
-PROBE_LENGTH = 0.1 * MESH_SCALE    # [m]
-PROBE_START = [0.0, -1.06 * MESH_SCALE, 0.0]  # [m] punta appena fuori dall'ingresso sulla faccia -Y
+# Sonda: raggio, lunghezza e punto di partenza sono impostati sopra in base alla mesh
 PROBE_START_YAW_DEG = 90.0    # orientamento iniziale: 0 = verso +X, 90 = verso +Y (dentro il canale)
 
 TRANSLATION_STEP = None       # [m] spostamento per passo con tasto premuto (None = meta' raggio)
@@ -73,13 +106,18 @@ PRINT_EVERY = 10              # stampa la posa della sonda ogni N passi (0 = mai
 
 def createScene(root, with_visual=True):
     # --- Mesh e parametri derivati ---------------------------------------------
+    up = np.zeros(3)
+    up[UP_AXIS] = 1.0
+
     points, tets = mesh_utilities.load_tet_mesh(MESH_FILE, MESH_SCALE)
+    if MESH_ROTATION_DEG:
+        points = R.from_rotvec(up * math.radians(MESH_ROTATION_DEG)).apply(points)
+    if MESH_UPSIDE_DOWN:
+        # 180 gradi attorno all'asse Y (quello lungo cui entra la sonda)
+        points = R.from_rotvec([0.0, math.pi, 0.0]).apply(points)
     bb_min, bb_max = points.min(axis=0), points.max(axis=0)
     size = bb_max - bb_min
     diag = float(np.linalg.norm(size))
-
-    up = np.zeros(3)
-    up[UP_AXIS] = 1.0
 
     radius = PROBE_RADIUS or 0.02 * diag
     length = PROBE_LENGTH or 0.4 * diag
