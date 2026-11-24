@@ -51,6 +51,27 @@ def outer_surface_triangles(points, tets, tol=1e-4):
     return faces[dist < tol * diag], len(faces)
 
 
+def boundary_triangles(tets, points):
+    """Tutti i triangoli di superficie (esterna e pareti del canale), orientati con la normale
+    (regola della mano destra) che ESCE dal materiale: sulle pareti del canale punta quindi verso
+    il lume, cioe' verso la sonda. Usati dalla telecamera endoscopica (endoscope_camera.py).
+
+    Una faccia e' di superficie se appartiene a un solo tetraedro; il suo orientamento si
+    sistema guardando il vertice opposto del tetraedro, che sta dalla parte del materiale."""
+    local = [(1, 2, 3, 0), (0, 2, 3, 1), (0, 1, 3, 2), (0, 1, 2, 3)]   # (faccia, vertice opposto)
+    faces = np.vstack([tets[:, [i, j, k]] for i, j, k, _ in local])
+    opposite = np.concatenate([tets[:, o] for _, _, _, o in local])
+    _, first, counts = np.unique(np.sort(faces, axis=1), axis=0,
+                                 return_index=True, return_counts=True)
+    boundary = first[counts == 1]
+    faces, opposite = faces[boundary].copy(), opposite[boundary]
+
+    a, b, c = (points[faces[:, i]] for i in range(3))
+    inward = np.einsum("ij,ij->i", np.cross(b - a, c - a), points[opposite] - a) > 0
+    faces[inward] = faces[inward][:, [0, 2, 1]]   # normale verso il materiale: si inverte
+    return faces
+
+
 def total_volume(points, tets):
     a, b, c, d = (points[tets[:, i]] for i in range(4))
     return float(np.abs(np.einsum("ij,ij->i", np.cross(b - a, c - a), d - a)).sum() / 6.0)

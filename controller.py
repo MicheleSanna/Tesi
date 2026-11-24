@@ -2,77 +2,133 @@ import Sofa
 import Sofa.Core
 import Sofa.Simulation
 import numpy as np
+import atexit
 import math
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import threading
 from scipy.spatial.transform import Rotation as R
 
-class ProbeController(Sofa.Core.Controller):
-    """Muove la sonda. Da tastiera in runSofa, oppure da codice con set_command() (per l'RL).
+from bronchoscope import LEVERS
 
-    In modalita' "force" i comandi spostano il bersaglio (target_dofs) e la sonda lo segue tirata
-    da una molla; in modalita' "kinematic" (target_dofs=None) spostano direttamente la sonda."""
 
-    KEYMAP = {  # (avanzamento, yaw, pitch, sollevamento)
-        "W": (+1, 0, 0, 0), "S": (-1, 0, 0, 0),
-        "A": (0, +1, 0, 0), "D": (0, -1, 0, 0),
-        "R": (0, 0, +1, 0), "F": (0, 0, -1, 0),
-        "Q": (0, 0, 0, +1), "E": (0, 0, 0, -1),
+class BronchoscopeController(Sofa.Core.Controller):
+    """Comandi del broncoscopio (bronchoscope.py), gli stessi che ha un operatore:
+
+      avanzamento   la mano spinge/tira la base dello strumento lungo l'asse del tubo introduttore
+      rotazione     la mano ruota lo strumento attorno al proprio asse (cosi' si sceglie in che
+                    direzione si piega la punta)
+      leva su/giu'  la leva del manico accorcia il cavo "su" e allunga di altrettanto il cavo
+                    "giu'" (puleggia), o viceversa: la punta si piega
+      leva sx/dx    seconda leva, solo con 4 cavi (broncoscopi robotici)
+
+    Da tastiera in runSofa oppure da codice con set_command() (RL). I comandi sono INCREMENTI:
+    con un tasto premuto (o un comando costante) lo strumento avanza, ruota o si piega a velocita'
+    costante, come quando un operatore spinge o sposta la leva con continuita'.
+
+    La mano e' collegata alla base da una molla: se lo strumento e' bloccato la mano non puo'
+    allontanarsi dalla base piu' di max_push_offset / max_roll_offset_deg, quindi la forza di
+    spinta e la coppia di rotazione non superano mai i massimi di ScopeParams (l'operatore
+    "sente" la resistenza e non forza oltre)."""
+
+    KEYMAP = {  # (avanzamento, rotazione, leva su/giu', leva sinistra/destra)
+        "W": (+1, 0, 0, 0), "S": (-1, 0, 0, 0),   # avanti / indietro
+        "A": (0, +1, 0, 0), "D": (0, -1, 0, 0),   # ruota antiorario / orario (visto dalla mano)
+        "R": (0, 0, +1, 0), "F": (0, 0, -1, 0),   # punta su / giu'
+        "Q": (0, 0, 0, +1), "E": (0, 0, 0, -1),   # punta a sinistra / destra (solo 4 cavi)
     }
 
-    def __init__(self, probe_dofs, up, trans_step, rot_step, target_dofs=None, coupling=None,
-                 col_dofs=None, col_local=None, labels=None, print_every=0, keyboard=None,
-                 *args, **kwargs):
+    def __init__(self, scope, up, trans_step, rot_step, bend_step, max_insertion=None,
+                 max_roll=math.pi, labels=None, print_every=0, keyboard=None, *args, **kwargs):
+        """scope: bronchoscope.Bronchoscope. trans_step [m], rot_step [rad] e bend_step (frazione
+        della corsa della leva) sono gli incrementi per passo con comando = 1. max_insertion [m]:
+        inserimento massimo (None = finche' la base resta nel tubo introduttore); max_roll [rad]:
+        rotazione massima in ciascun verso (il polso dell'operatore non gira all'infinito)."""
         Sofa.Core.Controller.__init__(self, *args, **kwargs)
-        self.dofs = probe_dofs
-        self.target = target_dofs       # bersaglio della molla (solo modalita' "force")
-        self.coupling = coupling        # dict: stiffness, angular_stiffness, max_offset, max_angle
-        self.col_dofs = col_dofs        # sfere di collisione (figlie della sonda via RigidMapping)
-        self.col_local = np.asarray(col_local, dtype=float) if col_local is not None else None
+        self.scope = scope
+        self.params = scope.params
+        self.dofs = scope.dofs                  # nodi dello strumento (0 = base, -1 = punta)
+        self.hand = scope.hand_dofs             # mano (bersaglio della molla)
+        self.axis = np.asarray(scope.axis, dtype=float)
         self.up = np.asarray(up, dtype=float)
+        self.hand_start = np.array(scope.start_poses[0], dtype=float)
+        self.rot0 = R.from_quat(self.hand_start[3:7])
+        self.n_levers = self.params.cable_ways // 2
         self.trans_step = trans_step
         self.rot_step = rot_step
-        self.command = np.zeros(4)      # comando one-shot da codice (set_command)
-        self.keyboard = keyboard        # WindowsKeyboard, o None (headless / RL)
-        self.held_keys = set()          # tasti attualmente premuti in runSofa
+        self.bend_step = bend_step
+        p = self.params
+        # la base (dove la tiene la mano) deve restare fuori dal paziente, dentro il tubo
+        # introduttore: al massimo si inserisce tutto tranne la sezione di curvatura e un margine
+        self.max_insertion = (max_insertion if max_insertion is not None
+                              else p.length - p.bending_length - 2.0 * p.radius)
+        self.max_roll = max_roll
+
+        # stato dei comandi (la "mano" e le leve)
+        self.insertion = 0.0                    # [m] avanzamento della mano dalla posa iniziale
+        self.roll = 0.0                         # [rad] rotazione della mano attorno all'asse
+        self.levers = np.zeros(2)               # posizione delle leve in [-1, 1]
+
+        self.command = np.zeros(4)              # comando one-shot da codice (set_command)
+        self.keyboard = keyboard                # WindowsKeyboard / LinuxKeyboard, o None (RL)
+        self.held_keys = set()                  # tasti attualmente premuti in runSofa
         self.x_was_down = False
-        self.start_pose = np.array(probe_dofs.position.value[0], dtype=float)
         self.reset_requested = False
-        self.labels = labels or []      # OglLabel a schermo (solo con interfaccia grafica)
+        self.labels = labels or []              # OglLabel a schermo (solo con interfaccia grafica)
         self.print_every = print_every
         self.step_count = 0
 
-        # assi di riferimento orizzontali: yaw = 0 quando la sonda punta verso +X
+        # assi di riferimento orizzontali per get_tip_angles(): yaw = 0 quando la punta guarda +X
         self.ref_fwd = np.array([1.0, 0.0, 0.0])
         self.ref_left = np.cross(self.up, self.ref_fwd)
 
     # --- API per codice esterno / RL -----------------------------------------
-    def set_command(self, advance=0.0, yaw=0.0, pitch=0.0, lift=0.0):
-        """Comando per il PROSSIMO passo, ogni valore in [-1, 1] (scalato dagli step)."""
-        self.command[:] = (advance, yaw, pitch, lift)
+    def set_command(self, advance=0.0, rotate=0.0, bend_ud=0.0, bend_lr=0.0):
+        """Comando per il PROSSIMO passo, ogni valore in [-1, 1] (scalato dagli step).
+        Con 2 cavi bend_lr viene ignorato."""
+        self.command[:] = (advance, rotate, bend_ud, bend_lr)
 
     def get_tip_pose(self):
-        """Posa (reale) della punta della sonda: [x, y, z, qx, qy, qz, qw]."""
+        """Posa della punta (ultimo nodo): [x, y, z, qx, qy, qz, qw]. Asse locale +X = direzione
+        in cui guarda la telecamera, +Z = alto dell'immagine."""
+        return np.array(self.dofs.position.value[-1], dtype=float)
+
+    def get_base_pose(self):
+        """Posa della base dello strumento (dove lo tiene la mano)."""
         return np.array(self.dofs.position.value[0], dtype=float)
 
     def get_target_pose(self):
-        """Posa comandata: il bersaglio in modalita' "force", la sonda stessa in "kinematic"."""
-        dofs = self.target if self.target is not None else self.dofs
-        return np.array(dofs.position.value[0], dtype=float)
+        """Posa comandata, cioe' quella della mano."""
+        return np.array(self.hand.position.value[0], dtype=float)
+
+    def get_centerline(self):
+        """Posizioni (N, 3) dei nodi lungo l'asse dello strumento, dalla base alla punta."""
+        return np.array(self.dofs.position.value, dtype=float)[:, 0:3]
 
     def get_coupling_load(self):
-        """(forza [N], coppia [N*m]) che la molla esercita sulla sonda (0, 0 in "kinematic").
-        Quando la sonda e' ferma e' uguale alla forza/coppia con cui la sonda spinge le pareti."""
-        if self.target is None:
-            return 0.0, 0.0
-        p, t = self.get_tip_pose(), self.get_target_pose()
-        offset = np.linalg.norm(t[0:3] - p[0:3])
-        angle = np.linalg.norm((R.from_quat(t[3:7]) * R.from_quat(p[3:7]).inv()).as_rotvec())
-        return (self.coupling["stiffness"] * offset,
-                self.coupling["angular_stiffness"] * angle)
+        """(forza di spinta [N], coppia di rotazione [N*m]) che la mano esercita sullo strumento,
+        con segno: forza > 0 = spinge in avanti, coppia > 0 = nel verso di rotazione positivo.
+        Quando lo strumento e' fermo e' la resistenza che oppone (pareti, attrito, introduttore)."""
+        axial, twist = self._hand_offsets()
+        return (self.params.hand_stiffness * axial, self.params.hand_angular_stiffness * twist)
+
+    def get_cable_tensions(self):
+        """Tensione di ogni cavo [N] (0 = lasco). CableConstraint restituisce un impulso (la
+        grandezza risolta dal solutore dei vincoli in un passo), quindi si divide per dt."""
+        dt = self.getContext().dt.value
+        return {name: float(cable.force.value) / dt for name, cable in self.scope.cables.items()}
+
+    def get_controls(self):
+        """Stato dei comandi: inserimento [m], rotazione [rad], leve [-1, 1] (su/giu', sx/dx)."""
+        return self.insertion, self.roll, self.levers.copy()
 
     def get_tip_angles(self):
-        """(yaw, pitch, roll) della sonda in gradi.
+        """(yaw, pitch, roll) della punta in gradi.
         yaw: rotazione attorno all'asse verticale (0 = verso +X); pitch: > 0 punta verso l'alto;
-        roll: rotazione attorno all'asse della sonda."""
+        roll: rotazione attorno all'asse della punta."""
         rot = R.from_quat(self.get_tip_pose()[3:7])
         fwd = rot.apply([1.0, 0.0, 0.0])
         yaw = math.atan2(fwd @ self.ref_left, fwd @ self.ref_fwd)
@@ -86,69 +142,97 @@ class ProbeController(Sofa.Core.Controller):
             y_body = rot.apply([0.0, 1.0, 0.0])
             roll = math.atan2(np.cross(left, y_body) @ fwd, left @ y_body)
         else:
-            roll = 0.0  # sonda verticale: roll e yaw non sono distinguibili
+            roll = 0.0  # punta verticale: roll e yaw non sono distinguibili
         return np.degrees([yaw, pitch, roll])
 
     def pose_text(self):
+        """Righe di testo con lo stato dello strumento (a schermo e nel terminale)."""
         p = self.get_tip_pose()
         yaw, pitch, roll = self.get_tip_angles()
         mm = p[0:3] * 1000.0
-        lines = (f"pos [mm]: x={mm[0]:+8.2f}  y={mm[1]:+8.2f}  z={mm[2]:+8.2f}",
-                 f"rot [deg]: yaw={yaw:+7.2f}  pitch={pitch:+7.2f}  roll={roll:+7.2f}",
-                 f"quat (x,y,z,w): [{p[3]:+.4f}, {p[4]:+.4f}, {p[5]:+.4f}, {p[6]:+.4f}]")
-        if self.target is not None:
-            force, torque = self.get_coupling_load()
-            lines += (f"molla: forza {force * 1000:6.1f} mN  coppia {torque * 1000:5.2f} mN*m",)
-        return lines
+        force, torque = self.get_coupling_load()
+        tensions = "  ".join(f"{name} {t:5.2f}" for name, t in self.get_cable_tensions().items())
+        levers = f"leva su/giu' {self.levers[0]:+.2f}"
+        if self.n_levers == 2:
+            levers += f"  sx/dx {self.levers[1]:+.2f}"
+        return (f"punta [mm]: x={mm[0]:+8.2f}  y={mm[1]:+8.2f}  z={mm[2]:+8.2f}   "
+                f"[deg] yaw={yaw:+7.2f}  pitch={pitch:+7.2f}  roll={roll:+7.2f}",
+                f"inserimento {self.insertion * 1000:6.1f} mm  rotazione {math.degrees(self.roll):+7.1f} deg  "
+                + levers,
+                f"spinta {force:+6.3f} N  coppia {torque * 1000:+6.2f} mN*m",
+                f"cavi [N]: {tensions}")
 
-    def reset_probe(self):
-        if self.target is None:
-            self._write_pose(self.start_pose)
-            return
-        # sonda dinamica: si riposizionano sonda e bersaglio e si azzera la velocita'
-        for dofs in (self.dofs, self.target):
-            for data in (dofs.position, dofs.free_position):
-                with data.writeableArray() as pos:
-                    pos[0] = self.start_pose
+    def reset_state(self):
+        """Riporta a zero comandi, leve e cavi e la mano nella posa iniziale. Da chiamare dopo
+        Sofa.Simulation.reset() (che riporta indietro i nodi ma non lo stato di questo controller)."""
+        self.insertion, self.roll = 0.0, 0.0
+        self.levers[:] = 0.0
+        self.command[:] = 0.0
+        self._write_hand()
+        self._write_cables()
+
+    def reset_scope(self):
+        """Reset completo dello strumento (tasto X): comandi a zero, nodi dritti nella posa
+        iniziale e fermi. Il tessuto non viene toccato."""
+        self.reset_state()
+        start = self.scope.start_poses
+        for data in (self.dofs.position, self.dofs.free_position):
+            with data.writeableArray() as pos:
+                pos[:] = start
         for data in (self.dofs.velocity, self.dofs.free_velocity):
             with data.writeableArray() as vel:
-                vel[0] = np.zeros(6)
+                vel[:] = 0.0
 
-    def _write_target(self, pose):
-        for data in (self.target.position, self.target.free_position):
+    # --- Mano e cavi --------------------------------------------------------------
+    def _hand_offsets(self):
+        """(scostamento assiale [m], scostamento di rotazione attorno all'asse [rad]) mano - base.
+        Sono piccoli per costruzione (li limita _apply_limits), quindi la rotazione relativa non
+        ha i salti di +-180 gradi che avrebbe un angolo assoluto."""
+        base, hand = self.get_base_pose(), self.get_target_pose()
+        axial = float((hand[0:3] - base[0:3]) @ self.axis)
+        rel = (R.from_quat(hand[3:7]) * R.from_quat(base[3:7]).inv()).as_rotvec()
+        return axial, float(rel @ self.axis)
+
+    def _apply_limits(self):
+        """Tiene la mano entro lo scostamento massimo dalla base (limite di forza e coppia),
+        dentro la corsa consentita (tubo introduttore) e dentro la rotazione massima."""
+        axial, twist = self._hand_offsets()
+        base_insertion = self.insertion - axial     # dove si trova davvero la base
+        base_roll = self.roll - twist
+        p = self.params
+        max_twist = math.radians(p.max_roll_offset_deg)
+        self.insertion = float(np.clip(self.insertion, base_insertion - p.max_push_offset,
+                                       base_insertion + p.max_push_offset))
+        self.roll = float(np.clip(self.roll, base_roll - max_twist, base_roll + max_twist))
+        self.insertion = float(np.clip(self.insertion, 0.0, self.max_insertion))
+        self.roll = float(np.clip(self.roll, -self.max_roll, self.max_roll))
+
+    def _write_hand(self):
+        """Scrive la posa della mano: traslata lungo l'asse e ruotata attorno all'asse.
+        Si aggiorna anche free_position, che FreeMotionAnimationLoop usa per il passo libero."""
+        pose = self.hand_start.copy()
+        pose[0:3] += self.axis * self.insertion
+        pose[3:7] = (R.from_rotvec(self.axis * self.roll) * self.rot0).as_quat()
+        for data in (self.hand.position, self.hand.free_position):
+            if len(data.value) != 1:
+                # dopo Sofa.Simulation.reset() free_position della mano (che non ha solutore)
+                # e' vuoto: si riassegna per intero
+                data.value = [pose.tolist()]
+                continue
             with data.writeableArray() as pos:
                 pos[0] = pose
 
-    def _clamp_target(self):
-        """Tiene il bersaglio entro max_offset / max_angle dalla sonda: cosi' la molla (e quindi
-        la forza sulle pareti) non puo' superare rigidezza * scostamento massimo."""
-        p, t = self.get_tip_pose(), self.get_target_pose()
-        offset = t[0:3] - p[0:3]
-        dist = np.linalg.norm(offset)
-        if dist > self.coupling["max_offset"]:
-            t[0:3] = p[0:3] + offset * (self.coupling["max_offset"] / dist)
-
-        rot_p = R.from_quat(p[3:7])
-        rel = (R.from_quat(t[3:7]) * rot_p.inv()).as_rotvec()
-        angle = np.linalg.norm(rel)
-        if angle > self.coupling["max_angle"]:
-            t[3:7] = (R.from_rotvec(rel * (self.coupling["max_angle"] / angle)) * rot_p).as_quat()
-        self._write_target(t)
-
-    def _write_pose(self, pose):
-        # si aggiorna anche free_position: FreeMotionAnimationLoop calcola i contatti sulle
-        # posizioni "libere", altrimenti la sonda verrebbe vista un passo in ritardo
-        with self.dofs.position.writeableArray() as pos:
-            pos[0] = pose
-        with self.dofs.free_position.writeableArray() as free:
-            free[0] = pose
-        # stessa cosa per le sfere di collisione (equivale a quanto fa la RigidMapping)
-        if self.col_dofs is not None:
-            spheres = pose[0:3] + R.from_quat(pose[3:7]).apply(self.col_local)
-            with self.col_dofs.position.writeableArray() as pos:
-                pos[:] = spheres
-            with self.col_dofs.free_position.writeableArray() as free:
-                free[:] = spheres
+    def _write_cables(self):
+        """Leve -> accorciamento imposto ai cavi. Puleggia: leva > 0 accorcia di delta il primo
+        cavo della coppia e allunga di delta il secondo (che resta lasco se non serve).
+        Con il gioco g: accorciamento = leva * (corsa + g) - g, cioe' a leva neutra entrambi i
+        cavi possono allungarsi di g senza tirare, e a fondo corsa si ha comunque la curvatura
+        massima."""
+        stroke = self.params.max_cable_displacement
+        slack = self.params.cable_slack
+        for lever, (positive, negative) in zip(self.levers[:self.n_levers], LEVERS):
+            self.scope.cables[positive].value = [float(lever * (stroke + slack) - slack)]
+            self.scope.cables[negative].value = [float(-lever * (stroke + slack) - slack)]
 
     # --- Tastiera -----------------------------------------------------------------
     def _poll_keyboard(self):
@@ -158,34 +242,39 @@ class ProbeController(Sofa.Core.Controller):
         focused = self.keyboard.has_focus()
         pressed = {k for k in self.KEYMAP if focused and self.keyboard.is_down(k)}
         for key in sorted(pressed - self.held_keys):
-            print(f"[sonda] tasto {key} premuto")
+            print(f"[broncoscopio] tasto {key} premuto")
         self.held_keys = pressed
 
         x_down = focused and self.keyboard.is_down("X")
         if x_down and not self.x_was_down:   # solo sul fronte di pressione, non a ogni passo
             self.reset_requested = True
-            print("[sonda] reset alla posizione iniziale")
+            print("[broncoscopio] reset alla posizione iniziale")
         self.x_was_down = x_down
 
     # --- Eventi SOFA ------------------------------------------------------------
     def onAnimateBeginEvent(self, event):
+        """Inizio passo: legge i comandi (codice + tastiera), muove mano e leve, aggiorna i cavi."""
         self._poll_keyboard()
         if self.reset_requested:
-            self.reset_probe()
+            self.reset_scope()
             self.reset_requested = False
         command = self.command + sum((np.array(self.KEYMAP[k], dtype=float) for k in self.held_keys),
                                      np.zeros(4))
         self.command[:] = 0.0
-        if np.any(command):
-            advance, yaw, pitch, lift = np.clip(command, -1.0, 1.0)
-            self._move(advance * self.trans_step,
-                       yaw * self.rot_step,
-                       pitch * self.rot_step,
-                       lift * self.trans_step)
-        if self.target is not None:
-            self._clamp_target()
+        advance, rotate, bend_ud, bend_lr = np.clip(command, -1.0, 1.0)
+
+        self.insertion += advance * self.trans_step
+        self.roll += rotate * self.rot_step
+        self.levers += np.array([bend_ud, bend_lr]) * self.bend_step
+        self.levers[self.n_levers:] = 0.0           # con 2 cavi la seconda leva non esiste
+        self.levers = np.clip(self.levers, -1.0, 1.0)
+
+        self._apply_limits()
+        self._write_hand()
+        self._write_cables()
 
     def onAnimateEndEvent(self, event):
+        """Fine passo: aggiorna il testo a schermo e, ogni print_every passi, il terminale."""
         self.step_count += 1
         lines = None
         if self.labels:
@@ -195,26 +284,192 @@ class ProbeController(Sofa.Core.Controller):
         if self.print_every and self.step_count % self.print_every == 0:
             lines = lines or self.pose_text()
             t = self.getContext().getTime()
-            print(f"[sonda] passo {self.step_count}  t={t:.2f}s  " + "  |  ".join(lines))
+            print(f"[broncoscopio] passo {self.step_count}  t={t:.2f}s  " + "  |  ".join(lines))
 
-    def _move(self, advance, yaw, pitch, lift):
-        p = self.get_target_pose()
-        rot = R.from_quat(p[3:7])  # SOFA e scipy usano entrambi l'ordine (x, y, z, w)
 
-        # yaw attorno all'asse verticale globale
-        rot = R.from_rotvec(self.up * yaw) * rot
+class EndoscopeController(Sofa.Core.Controller):
+    """Telecamera endoscopica sulla punta della sonda (vedi endoscope_camera.py).
 
-        # pitch attorno all'asse laterale della sonda
-        fwd = rot.apply([1.0, 0.0, 0.0])
-        side = np.cross(fwd, self.up)
-        n = np.linalg.norm(side)
-        if n > 1e-6:
-            rot = R.from_rotvec(side / n * pitch) * rot
+    - capture(): scatta un'immagine dello stato attuale (la usano l'ambiente RL e view_agent.py).
+    - Con l'interfaccia grafica, alla fine di ogni passo mostra in una finestra separata:
+        [ anteprima ad alta risoluzione | cio' che vede l'agente RL | profondita' ]
+      La finestra e' un altro processo (endoscope_viewer.py), perche' la finestra di OpenCV nello
+      stesso processo di runSofa lo manda in crash (conflitto tra le librerie grafiche).
+    - Se save_dir e' impostata, salva la stessa composizione in PNG ogni save_every passi
+      (utile anche senza GUI). Se la finestra non si puo' aprire, si passa da soli al salvataggio.
 
-        fwd = rot.apply([1.0, 0.0, 0.0])
-        p[0:3] += fwd * advance + self.up * lift
-        p[3:7] = rot.as_quat()
-        if self.target is not None:
-            self._write_target(p)
-        else:
-            self._write_pose(p)
+    I tasti per muovere la sonda vanno premuti con la finestra di runSofa in primo piano, non con
+    quella dell'endoscopio."""
+
+    def __init__(self, camera, maze_dofs, probe_ctrl, resolution=64, show_window=False,
+                 preview_resolution=320, save_dir=None, save_every=0, *args, **kwargs):
+        Sofa.Core.Controller.__init__(self, *args, **kwargs)
+        self.camera = camera                # EndoscopeCamera
+        self.maze_dofs = maze_dofs          # MechanicalObject del labirinto (posizioni deformate)
+        self.probe_ctrl = probe_ctrl        # BronchoscopeController (posa della punta)
+        self.resolution = resolution        # immagine dell'agente RL (quadrata)
+        self.preview_resolution = preview_resolution
+        self.show_window = show_window
+        self.save_dir = save_dir
+        self.save_every = save_every
+        self.step_count = 0
+        self.last_rgb = None                # ultima immagine dell'agente (uint8, H x W x 3)
+        self.last_depth = None              # ultima profondita' (float32, H x W, metri)
+        self._cv2 = None
+        self._viewer = None                 # processo endoscope_viewer.py
+        self._pending = None                # ultima immagine non ancora inviata alla finestra
+        self._cond = threading.Condition()  # sveglia il thread che invia le immagini
+
+    # --- API ---------------------------------------------------------------------
+    def sync_mesh(self):
+        """Copia nella telecamera le posizioni attuali dei nodi del labirinto.
+        Con CUDA (CudaVec3f) .value copia i dati dalla GPU di SOFA alla CPU: ~0.4 MB con 30k nodi."""
+        self.camera.update_mesh(np.asarray(self.maze_dofs.position.value))
+
+    def capture(self, resolution=None, sync=True):
+        """Scatta un'immagine dalla punta della sonda: (rgb uint8 (H, W, 3), depth float32 (H, W))."""
+        if sync:
+            self.sync_mesh()
+        rgb, depth = self.camera.render(self.probe_ctrl.get_tip_pose(), resolution or self.resolution)
+        if resolution is None or resolution == self.resolution:
+            self.last_rgb, self.last_depth = rgb, depth
+        return rgb, depth
+
+    # --- Evento SOFA: fine di ogni passo -----------------------------------------
+    def onAnimateEndEvent(self, event):
+        self.step_count += 1
+        saving = bool(self.save_dir) and self.save_every > 0 and self.step_count % self.save_every == 0
+        if not (self.show_window or saving):
+            return   # in training (headless) le immagini le chiede l'ambiente con capture()
+
+        rgb, depth = self.capture()
+        preview, _ = self.capture(self.preview_resolution, sync=False)   # stessa geometria, piu' pixel
+        panel = self._compose(preview, rgb, depth)
+
+        if self.show_window:
+            self._show(panel)
+        if saving:
+            self._save(panel)
+
+    # --- Composizione dell'immagine ------------------------------------------------
+    def _compose(self, preview, rgb, depth):
+        """Affianca anteprima, vista dell'agente e profondita', tutte alla dimensione dell'anteprima.
+        Restituisce un'immagine BGR (l'ordine dei canali che usa OpenCV)."""
+        cv2 = self._import_cv2()
+        size = preview.shape[0]
+        # vista dell'agente ingrandita senza interpolazione: si vedono i pixel veri della rete
+        agent = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_NEAREST)
+        from endoscope_camera import depth_to_image
+        d = depth_to_image(depth, self.camera.optics.max_distance)
+        d = cv2.resize(cv2.applyColorMap(d, cv2.COLORMAP_INFERNO), (size, size),
+                       interpolation=cv2.INTER_NEAREST)
+        panel = np.hstack([cv2.cvtColor(preview, cv2.COLOR_RGB2BGR),
+                           cv2.cvtColor(agent, cv2.COLOR_RGB2BGR), d])
+        for i, text in enumerate(("anteprima", f"agente {self.resolution}x{self.resolution}",
+                                  "profondita'")):
+            cv2.putText(panel, text, (i * size + 8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+        force, torque = self.probe_ctrl.get_coupling_load()
+        cv2.putText(panel, f"forza {force:6.2f} N", (2 * size + 8, size - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        return panel
+
+    # --- Finestra (processo separato) ------------------------------------------------
+    def _show(self, panel):
+        if self._viewer is None:
+            self._start_viewer()
+            if self._viewer is None:
+                return
+        code = self._viewer.poll()
+        if code is not None:   # il processo della finestra e' terminato
+            self._stop_viewer()
+            self.show_window = False
+            if code == 0:
+                print("[endoscopio] finestra chiusa")
+            else:
+                self._fallback_to_saving(f"il visualizzatore e' terminato con codice {code}")
+            return
+        # si lascia l'immagine al thread di invio; se quello e' ancora occupato con la precedente,
+        # la precedente viene semplicemente scartata (la simulazione non aspetta mai la finestra)
+        with self._cond:
+            self._pending = panel
+            self._cond.notify()
+
+    def _start_viewer(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "endoscope_viewer.py")
+        # Qt di OpenCV non ha il plugin per Wayland: si usa X11 (XWayland) per non avere avvisi
+        env = dict(os.environ, QT_QPA_PLATFORM=os.environ.get("QT_QPA_PLATFORM", "xcb"))
+        try:
+            self._viewer = subprocess.Popen([_python_executable(), script], stdin=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL, env=env)
+        except OSError as e:
+            self.show_window = False
+            self._fallback_to_saving(f"impossibile avviare il visualizzatore ({e})")
+            return
+        threading.Thread(target=self._send_loop, daemon=True).start()
+        atexit.register(self._stop_viewer)   # alla fine di runSofa la finestra si chiude da sola
+
+    def _send_loop(self):
+        """Thread che invia le immagini al visualizzatore (scrivere nella pipe puo' bloccare)."""
+        viewer = self._viewer
+        while True:
+            with self._cond:
+                while self._pending is None:
+                    self._cond.wait()
+                panel, self._pending = self._pending, None
+            if panel is _STOP:
+                return
+            header = struct.pack("<II", panel.shape[0], panel.shape[1])   # altezza, larghezza
+            try:
+                viewer.stdin.write(header + np.ascontiguousarray(panel).tobytes())
+                viewer.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                return   # finestra chiusa: se ne accorge _show() con poll()
+
+    def _stop_viewer(self):
+        if self._viewer is None:
+            return
+        with self._cond:
+            self._pending = _STOP
+            self._cond.notify()
+        try:
+            self._viewer.stdin.close()   # il visualizzatore legge "fine" e si chiude
+        except OSError:
+            pass
+        self._viewer = None
+
+    # --- Salvataggio su disco ----------------------------------------------------------
+    def _fallback_to_saving(self, reason):
+        self.save_dir = self.save_dir or "endoscope_frames"
+        self.save_every = self.save_every or 1
+        print(f"[endoscopio] finestra non disponibile: {reason}. "
+              f"Salvo le immagini in {os.path.abspath(self.save_dir)}")
+
+    def _save(self, panel):
+        cv2 = self._import_cv2()
+        os.makedirs(self.save_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(self.save_dir, f"endoscopio_{self.step_count:06d}.png"), panel)
+
+    def _import_cv2(self):
+        # import ritardato: OpenCV serve solo per visualizzare/salvare, non per il training.
+        # In questo processo si usano solo le funzioni di elaborazione (resize, testo, PNG), mai
+        # quelle delle finestre (imshow), che andrebbero in conflitto con la GUI di SOFA.
+        if self._cv2 is None:
+            import cv2
+            self._cv2 = cv2
+        return self._cv2
+
+
+_STOP = object()   # segnale per fermare il thread di invio
+
+
+def _python_executable():
+    """L'interprete Python dell'ambiente conda. Dentro runSofa sys.executable e' runSofa stesso,
+    quindi lo si cerca in sys.prefix (la cartella dell'ambiente) o nel PATH."""
+    if os.path.basename(sys.executable).lower().startswith("python"):
+        return sys.executable
+    for candidate in (os.path.join(sys.prefix, "bin", "python3"), os.path.join(sys.prefix, "python.exe"),
+                      shutil.which("python3"), shutil.which("python")):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    raise OSError("interprete Python non trovato")
