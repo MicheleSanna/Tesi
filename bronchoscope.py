@@ -25,6 +25,12 @@ COSA MODELLA (e come lo fa uno strumento vero)
   fino a ~1 mm dal tessuto: in prova, con un tratto libero di 2-3 cm tra la fine del tubo e la
   trachea, lo strumento spinto contro la carena faceva un'ansa li', passava attorno al bordo del
   tubo e la simulazione esplodeva.
+  Il tubo NON e' un oggetto di collisione: i nodi dello strumento che si trovano al suo interno
+  possono solo scorrere lungo l'asse e ruotarci attorno (vincolo proiettivo, vedi sotto). Con il
+  tubo fatto di triangoli, per evitare contatti continui il gioco tubo-strumento doveva superare
+  la distanza di allarme delle collisioni; in quel gioco lo shaft compresso serpeggiava, toccava
+  il tubo con >100 sfere insieme (solutore dei vincoli lento e non convergente) e, spinto di lato
+  abbastanza in fretta, ne attraversava la parete: forze di migliaia di N e simulazione esplosa.
 
 COME E' FATTO IN SOFA
   - Shaft + sezione di curvatura: una catena di nodi Rigid3d (posizione + orientamento) uniti da
@@ -52,6 +58,9 @@ COME E' FATTO IN SOFA
     valueType="displacement": si impone l'accorciamento del cavo, come fa la leva.
   - Contatto: una fila di sfere (SphereCollisionModel) lungo l'asse, mappate sui nodi con
     RigidMapping. Le sfere si sovrappongono, quindi formano un tubo continuo di raggio r.
+  - Tubo introduttore: un PartialFixedProjectiveConstraint sui nodi che stanno nel tubo blocca
+    traslazione e rotazione trasversali all'asse (gioco zero, nessun vincolo da risolvere). A ogni
+    passo il controller aggiorna l'elenco dei nodi dentro il tubo (Bronchoscope.update_guide).
   - Mano: un nodo Rigid3d senza dinamica (comandato dal controller) collegato alla base da una
     molla (RestShapeSpringsForceField). Lo scostamento mano-base e' limitato dal controller,
     quindi la forza di spinta e la coppia di rotazione restano limitate (vedi controller.py).
@@ -134,10 +143,8 @@ class ScopeParams:
     max_cable_force: float = 20.0           # [N] tensione massima di un cavo (la curvatura libera a
                                             # 180 gradi ne richiede ~10); oltre, il cavo "slitta"
 
-    # tubo introduttore (fuori dal paziente)
-    # Il gioco tra strumento e tubo deve superare la distanza di allarme delle collisioni
-    # (0.5 * radius in scene_maze.py), altrimenti ogni sfera nel tubo genera contatti inutili
-    introducer_radius: float = None  # raggio interno (None = 2.2 * radius)
+    # tubo introduttore (fuori dal paziente): solo grafica, la guida e' un vincolo sui nodi
+    introducer_radius: float = None  # raggio interno disegnato (None = 2.2 * radius)
     introducer_sides: int = 16       # lati del poligono che approssima il tubo
     introducer_ring_spacing: float = None   # distanza tra gli anelli della mesh (None = 6 * radius)
 
@@ -334,16 +341,57 @@ class Bronchoscope:
     start_poses: np.ndarray      # (N, 7) pose iniziali dei nodi
     axis: np.ndarray             # direzione di inserimento (asse del tubo introduttore)
     mouth: np.ndarray            # posizione iniziale della punta, appena fuori dal paziente
-    introducer_group: int = 1    # gruppo di collisione del tubo introduttore
+    guide: object                # PartialFixedProjectiveConstraint dei nodi dentro il tubo introduttore
+    introducer_end: float        # [m] fine del tubo introduttore: distanza da mouth lungo axis
+
+    def nodes_in_introducer(self):
+        """Indici dei nodi che in questo momento stanno dentro il tubo introduttore, cioe' che
+        lungo l'asse non hanno ancora superato la sua fine."""
+        pos = np.asarray(self.dofs.position.value, dtype=float)[:, 0:3]
+        depth = (pos - self.mouth) @ self.axis
+        return np.flatnonzero(depth <= self.introducer_end)
+
+    def update_guide(self):
+        """Applica il vincolo del tubo ai nodi che ci sono dentro adesso (va chiamata a ogni passo:
+        inserendo i nodi escono dal tubo, ritirando ci rientrano). PartialFixedProjectiveConstraint
+        rilegge gli indici a ogni proiezione, quindi basta cambiarli.
+
+        Il vincolo blocca solo le VELOCITA' trasversali: un nodo che rientra nel tubo mentre fuori
+        lo strumento e' piegato resterebbe fermo dove si trova, fuori asse, e ritirando lo
+        scostamento si accumulerebbe nodo dopo nodo (in prova fino a 2.5 mm, un tubo "storto").
+        Per questo i nodi nel tubo vengono anche riportati sull'asse e allineati ad esso (vedi
+        _center_on_axis); per quelli gia' sull'asse non cambia nulla."""
+        inside = self.nodes_in_introducer()
+        self.guide.indices.value = inside.tolist()
+        if len(inside):
+            for data in (self.dofs.position, self.dofs.free_position):
+                if len(data.value) <= inside[-1]:
+                    continue        # free_position puo' essere vuoto prima del primo passo
+                with data.writeableArray() as pos:
+                    pos[inside] = self._center_on_axis(pos[inside])
+
+    def _center_on_axis(self, poses):
+        """Pose (K, 7) riportate sull'asse del tubo: si toglie lo scostamento trasversale della
+        posizione e si ruota il nodo del minimo necessario perche' il suo asse +X (l'asse dello
+        strumento) coincida con quello del tubo, conservando la rotazione attorno all'asse."""
+        poses = np.array(poses, dtype=float)
+        rel = poses[:, 0:3] - self.mouth
+        poses[:, 0:3] = self.mouth + np.outer(rel @ self.axis, self.axis)
+        rot = R.from_quat(poses[:, 3:7])
+        tangent = rot.apply([1.0, 0.0, 0.0])
+        # rotazione minima tangente -> asse: asse di rotazione tangente x asse, angolo tra i due
+        cross = np.cross(tangent, self.axis)
+        angle = np.arctan2(np.linalg.norm(cross, axis=1), tangent @ self.axis)
+        norm = np.linalg.norm(cross, axis=1, keepdims=True)
+        rotvec = np.where(norm > 1e-12, cross / np.maximum(norm, 1e-12), 0.0) * angle[:, None]
+        poses[:, 3:7] = (R.from_rotvec(rotvec) * rot).as_quat()
+        return poses
 
 
-def add_bronchoscope(root, tip_start, q0, p: ScopeParams, with_visual=True, collision_group=1,
-                     introducer_end=None):
+def add_bronchoscope(root, tip_start, q0, p: ScopeParams, with_visual=True, introducer_end=None):
     """Aggiunge a root il broncoscopio (con la punta in tip_start, asse lungo +X di q0), la mano
     che lo spinge e il tubo introduttore.
 
-    collision_group: gruppo del tubo introduttore; va dato lo stesso gruppo alla mesh dei
-        polmoni, cosi' tubo e polmoni non vengono testati tra loro.
     introducer_end: distanza [m] da tip_start, lungo l'asse, a cui finisce il tubo (> 0 = oltre
         la punta iniziale, che allora parte dentro il tubo). Conviene farlo finire appena prima
         del tessuto (vedi introducer_end_for_mesh). None = finisce sulla punta iniziale."""
@@ -410,6 +458,15 @@ def add_bronchoscope(root, tip_start, q0, p: ScopeParams, with_visual=True, coll
                     drawSpring=with_visual)
     scope.addObject("GenericConstraintCorrection")
 
+    # --- tubo introduttore: guida dei nodi che ci stanno dentro -----------------------------
+    # Blocca le direzioni trasversali all'asse (traslazione e rotazione); restano libere solo
+    # l'avanzamento e la rotazione attorno all'asse. projectVelocity=True azzera anche la velocita'
+    # trasversale che un nodo ha quando rientra nel tubo (altrimenti continuerebbe a derivare).
+    # Gli indici iniziali sono provvisori: li aggiorna update_guide() a ogni passo.
+    guide = scope.addObject("PartialFixedProjectiveConstraint", name="tuboIntroduttore",
+                            indices=[0], fixedDirections=_guide_directions(axis),
+                            projectVelocity=True)
+
     # --- cavi (SoftRobots) ---------------------------------------------------------------
     cables = _add_cables(scope, geom, p, poses, root.dt.value)
 
@@ -434,10 +491,12 @@ def add_bronchoscope(root, tip_start, q0, p: ScopeParams, with_visual=True, coll
         skin.addObject("RigidMapping", input="@../dofs", output="@ogl", globalToLocalCoords=True,
                        rigidIndexPerPoint=node_of.tolist())
 
-    # --- tubo introduttore: dalla base iniziale (con un po' di margine) fino al tessuto -------
+    # --- tubo introduttore (grafica): dalla base iniziale (con un po' di margine) al tessuto --
     mouth = np.asarray(tip_start, dtype=float)
-    _add_introducer(root, mouth - axis * (p.length + 4.0 * p.radius),
-                    mouth + axis * (introducer_end or 0.0), p, collision_group, with_visual)
+    introducer_end = introducer_end or 0.0
+    if with_visual:
+        _add_introducer_visual(root, mouth - axis * (p.length + 4.0 * p.radius),
+                               mouth + axis * introducer_end, p)
 
     print("=== Broncoscopio ===")
     print(f"  lunghezza {p.length * 1000:.0f} mm (curvatura {p.bending_length * 1000:.0f} mm), "
@@ -448,9 +507,28 @@ def add_bronchoscope(root, tip_start, q0, p: ScopeParams, with_visual=True, coll
           f"{p.max_bend_deg:g} gradi (corsa {p.max_cable_displacement * 1000:.2f} mm)")
     print(f"  mano: spinta max {p.max_push_force:.2f} N, coppia max {p.max_roll_torque * 1000:.1f} mN*m")
 
-    return Bronchoscope(params=p, geometry=geom, node=scope, dofs=dofs, hand_dofs=hand_dofs,
-                        col_dofs=col_dofs, cables=cables, start_poses=poses, axis=axis,
-                        mouth=mouth, introducer_group=collision_group)
+    bronchoscope = Bronchoscope(params=p, geometry=geom, node=scope, dofs=dofs, hand_dofs=hand_dofs,
+                                col_dofs=col_dofs, cables=cables, start_poses=poses, axis=axis,
+                                mouth=mouth, guide=guide, introducer_end=introducer_end)
+    bronchoscope.update_guide()
+    return bronchoscope
+
+
+def _guide_directions(axis):
+    """fixedDirections di PartialFixedProjectiveConstraint (Rigid3d: tx ty tz rx ry rz, nel
+    sistema globale) per un nodo che puo' solo scorrere lungo axis e ruotarci attorno.
+
+    Il vincolo blocca direzioni GLOBALI, quindi l'asse di inserimento deve essere un asse
+    coordinato (con PROBE_START_YAW_DEG = 0 o 90 lo e')."""
+    axis = np.asarray(axis, dtype=float)
+    k = int(np.argmax(np.abs(axis)))
+    if abs(abs(axis[k]) - 1.0) > 1e-6:
+        raise ValueError(f"il tubo introduttore richiede un asse di inserimento parallelo a X, Y o Z "
+                         f"(asse attuale {np.round(axis, 4).tolist()})")
+    fixed = [1] * 6
+    fixed[k] = 0          # avanzamento lungo l'asse
+    fixed[3 + k] = 0      # rotazione attorno all'asse
+    return fixed
 
 
 def _add_gravity_compensation(scope, n_nodes, node_mass, gravity):
@@ -524,14 +602,11 @@ def introducer_end_for_mesh(points, tip_start, axis, gap):
     return first - gap
 
 
-def _add_introducer(root, start, end, p: ScopeParams, group, with_visual):
-    """Tubo rigido e fisso (non simulato) attorno al tratto di strumento fuori dal paziente."""
+def _add_introducer_visual(root, start, end, p: ScopeParams):
+    """Disegno (semitrasparente) del tubo introduttore attorno al tratto di strumento fuori dal
+    paziente. E' solo grafica: a guidare lo strumento e' il vincolo creato in add_bronchoscope."""
     points, tris = tube_mesh(start, end, p.introducer_radius, p.introducer_sides,
                              p.introducer_ring_spacing, inward=True)
     tube = root.addChild("TuboIntroduttore")
-    tube.addObject("MeshTopology", name="topo", position=points.tolist(), triangles=tris.tolist())
-    tube.addObject("MechanicalObject", name="dofs", template="Vec3d", position=points.tolist())
-    tube.addObject("TriangleCollisionModel", moving=False, simulated=False, group=group)
-    if with_visual:
-        tube.addObject("OglModel", name="ogl", position=points.tolist(), triangles=tris.tolist(),
-                       color=[0.7, 0.75, 0.8, 0.25])
+    tube.addObject("OglModel", name="ogl", position=points.tolist(), triangles=tris.tolist(),
+                   color=[0.7, 0.75, 0.8, 0.25])

@@ -182,6 +182,7 @@ class BronchoscopeController(Sofa.Core.Controller):
         for data in (self.dofs.velocity, self.dofs.free_velocity):
             with data.writeableArray() as vel:
                 vel[:] = 0.0
+        self.scope.update_guide()
 
     # --- Mano e cavi --------------------------------------------------------------
     def _hand_offsets(self):
@@ -272,6 +273,7 @@ class BronchoscopeController(Sofa.Core.Controller):
         self._apply_limits()
         self._write_hand()
         self._write_cables()
+        self.scope.update_guide()       # nodi entrati / usciti dal tubo introduttore
 
     def onAnimateEndEvent(self, event):
         """Fine passo: aggiorna il testo a schermo e, ogni print_every passi, il terminale."""

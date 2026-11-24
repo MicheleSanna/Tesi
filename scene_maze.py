@@ -398,14 +398,12 @@ def createScene(root, with_visual=True, with_camera=None):
         # in CUDA); le forze di contatto tornano sulla GPU attraverso la mapping
         surf.addObject("MechanicalObject", name="dofs", template="Vec3d")
         surf.addObject("IdentityMapping", input="@../dofs", output="@dofs")
-    # gruppo 1 = stesso gruppo del tubo introduttore: tubo e tessuto non vengono testati tra
-    # loro (nessuna collisione possibile tra modelli dello stesso gruppo).
     # Solo triangoli: lo strumento e' fatto di sfere, e il test sfera-triangolo usa gia' il punto
     # del triangolo piu' vicino (anche su spigoli e vertici). Con anche LineCollisionModel e
     # PointCollisionModel lo stesso contatto veniva creato fino a 3 volte: in prova, spingendo lo
     # strumento contro la carena, 1500 vincoli in gran parte doppi, Gauss-Seidel che non
     # convergeva e simulazione che divergeva.
-    surf.addObject("TriangleCollisionModel", group=1)
+    surf.addObject("TriangleCollisionModel")
     # MechanicalObject su cui agiscono i contatti con il tessuto (per ContactMonitor)
     wall_dofs = surf.getObject("dofs") if use_cuda else maze_dofs
     if with_visual:
@@ -443,7 +441,7 @@ def createScene(root, with_visual=True, with_camera=None):
     # il tubo introduttore arriva fino a INTRODUCER_GAP dal tessuto (nessun tratto libero)
     tube_end = bronchoscope.introducer_end_for_mesh(points, start, axis, INTRODUCER_GAP)
     scope = bronchoscope.add_bronchoscope(root, start, q0, params, with_visual=with_visual,
-                                          collision_group=1, introducer_end=tube_end)
+                                          introducer_end=tube_end)
 
     # tastiera solo con l'interfaccia grafica (in headless / RL si comanda con set_command)
     keyboard = create_keyboard() if with_visual else None
