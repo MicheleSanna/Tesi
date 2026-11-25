@@ -27,7 +27,10 @@ COSA RENDE L'IMMAGINE SIMILE A QUELLA DI UN VERO ENDOSCOPIO
      endoscopie). Se la punta tocca la parete l'immagine diventa quasi tutta rossa e saturata.
   2. Ottica grandangolare fisheye (100-140 gradi) con immagine circolare e angoli neri.
   3. Riflessi speculari (la mucosa e' bagnata): termine di Blinn-Phong.
-  4. Texture procedurale rosata con una rete di vasi sanguigni (rumore di Perlin 3D).
+  4. Mucosa di colore uniforme rosato (come appare di solito nelle broncoscopie reali, dove i
+     vasi sono poco visibili). Volendo si puo' aggiungere una texture procedurale (rumore di
+     Perlin 3D) con due componenti indipendenti: macchie leggere ('mottle') e una rete di vasi
+     sanguigni ('vessels').
   5. Vignettatura (bordi piu' scuri), rumore del sensore, correzione gamma.
 
 USO
@@ -63,6 +66,9 @@ class Optics:
     vignette: float        # quanto si scuriscono i bordi dell'immagine (0 = niente)
     noise: float           # deviazione standard del rumore del sensore (luminosita' in [0, 1])
     texture_scale: float   # dimensione tipica delle maglie dei vasi sanguigni [m]
+    mottle_scale: float    # dimensione tipica delle macchie della mucosa [m]
+    mottle: float          # intensita' delle macchie della mucosa: 0 = niente, 1 = +-15% di luminosita'
+    vessels: float         # intensita' dei vasi sanguigni: 0 = niente, 1 = vasi ben visibili
     texture_seed: int      # seme della texture (cambiarlo = un altro "paziente")
 
 
@@ -98,17 +104,30 @@ def _normalize(normals: wp.array(dtype=wp.vec3)):
 # Texture del tessuto
 # =============================================================================
 @wp.func
-def _tissue_albedo(p: wp.vec3, scale: float, seed: int):
+def _tissue_albedo(p: wp.vec3, scale: float, seed: int, mottle_scale: float,
+                   mottle_strength: float, vessel_strength: float):
     """Colore del tessuto nel punto p (posizione A RIPOSO, in metri).
 
     - Fondo rosato con macchie ampie e leggere (variazioni di colore della mucosa).
     - Rete di vasi: il rumore di Perlin e' una funzione liscia che vale 0 su superfici
       "ondulate"; dove queste superfici tagliano la parete si ottengono linee curve e ramificate,
-      che sembrano capillari. Due reti: vasi piu' grandi e marcati, capillari piu' fini e tenui."""
+      che sembrano capillari. Due reti: vasi piu' grandi e marcati, capillari piu' fini e tenui.
+    - mottle_strength e vessel_strength regolano i due effetti in modo indipendente
+      (0 = assente, 1 = pieno). Un effetto a 0 non viene nemmeno calcolato."""
+    base = wp.vec3(0.82, 0.40, 0.34)            # mucosa rosa-salmone
     q = p / scale
 
-    # macchie a bassa frequenza: noise in [-1, 1] -> luminosita' del fondo +-15%
-    mottle = wp.noise(wp.rand_init(seed), q * 0.35)
+    # macchie. Il rumore di Perlin ha "periodo" circa 1, quindi dividendo per mottle_scale una
+    # macchia chiara (o scura) e' larga circa mottle_scale / 2 e la distanza tra due macchie e'
+    # circa mottle_scale. Il rumore di Warp in pratica sta quasi sempre in +-0.32 (90% dei punti,
+    # misurato), non in +-1: si divide per 0.32 cosi' che, a intensita' 1, la luminosita' del fondo
+    # vari di circa +-15% (piu' raramente fino a +-30%)
+    if mottle_strength > 0.0:
+        mottle = wp.noise(wp.rand_init(seed), p / mottle_scale) / 0.32
+        base = base * wp.max(1.0 + 0.15 * mottle_strength * mottle, 0.1)
+
+    if vessel_strength <= 0.0:
+        return base                             # niente vasi: solo il fondo (eventualmente macchiato)
 
     # vasi grandi: pixel "vicini allo zero" del rumore. Lo spessore della linea varia lungo il
     # vaso (un secondo rumore lento lo modula), cosi' i vasi si assottigliano e spariscono come
@@ -120,9 +139,8 @@ def _tissue_albedo(p: wp.vec3, scale: float, seed: int):
     n2 = wp.noise(wp.rand_init(seed + 2), q * 2.7)
     width2 = 0.04 * wp.max(wp.noise(wp.rand_init(seed + 4), q * 0.8), 0.0)
     vessel_small = 1.0 - wp.smoothstep(0.0, width2 + 1.0e-4, wp.abs(n2))
-    vessels = wp.max(0.85 * vessel_big, 0.35 * vessel_small)
+    vessels = wp.min(vessel_strength * wp.max(0.85 * vessel_big, 0.35 * vessel_small), 1.0)
 
-    base = wp.vec3(0.82, 0.40, 0.34) * (1.0 + 0.15 * mottle)   # mucosa rosa-salmone
     vessel_color = wp.vec3(0.45, 0.05, 0.07)                   # sangue
     return base * (1.0 - vessels) + vessel_color * vessels
 
@@ -188,7 +206,9 @@ def _render(mesh: wp.uint64,
 
             # colore del tessuto dalla posizione a riposo del punto colpito
             p_rest = rest[a] * hit.u + rest[b] * hit.v + rest[c] * w
-            albedo = _tissue_albedo(p_rest, opt.texture_scale, opt.texture_seed)
+            albedo = _tissue_albedo(p_rest, opt.texture_scale, opt.texture_seed,
+                                    opt.mottle_scale, opt.mottle,
+                                    opt.vessels)
 
             # diffusione (Lambert) + riflesso speculare (Blinn-Phong) + un minimo di luce diffusa.
             # Luce e telecamera coincidono, quindi il "vettore a meta' strada" di Blinn-Phong e'
@@ -237,6 +257,10 @@ class EndoscopeCamera:
       fov_deg        campo visivo totale (endoscopi reali: 100-140 gradi)
       light_range    distanza a cui una parete perpendicolare appare con luminosita' "piena"
       texture_scale  dimensione delle maglie dei vasi
+      mottle_scale   dimensione delle macchie (distanza tipica tra due macchie) [m];
+                     None = texture_scale / 0.35, cioe' come nella versione originale
+      mottle         intensita' delle macchie della mucosa (0 = niente, 1 = +-15% di luminosita')
+      vessels        intensita' dei vasi sanguigni (0 = niente, 1 = ben visibili)
       max_distance   distanza massima visibile (oltre: nero)
       lens_offset    distanza della lente dal punto della posa lungo l'asse della sonda
                      (la posa di SOFA e' il centro della sfera di punta: la lente sta davanti)
@@ -246,8 +270,9 @@ class EndoscopeCamera:
     """
 
     def __init__(self, rest_points, triangles, fov_deg=120.0, light_range=0.006,
-                 texture_scale=0.003, max_distance=0.3, lens_offset=0.0,
-                 ambient=0.01, specular=0.6, shininess=25.0, vignette=0.35, noise=0.01,
+                 texture_scale=0.003, mottle=1.0, mottle_scale=None, vessels=0.0,
+                 max_distance=0.3, lens_offset=0.0,
+                 ambient=0.01, specular=0.8, shininess=25.0, vignette=0.35, noise=0.01,
                  seed=0, device=None):
         wp.init()
         self.device = device or ("cuda:0" if wp.is_cuda_available() else "cpu")
@@ -278,6 +303,9 @@ class EndoscopeCamera:
         self.optics.noise = noise
         self.optics.texture_scale = texture_scale
         self.optics.texture_seed = int(seed)
+        self.optics.mottle = float(mottle)
+        self.optics.mottle_scale = float(mottle_scale or texture_scale / 0.35)
+        self.optics.vessels = float(vessels)
         self.lens_offset = lens_offset
 
         self.frame = 0       # contatore delle immagini: cambia il rumore del sensore a ogni scatto

@@ -301,13 +301,23 @@ class EndoscopeController(Sofa.Core.Controller):
       (utile anche senza GUI). Se la finestra non si puo' aprire, si passa da soli al salvataggio.
 
     I tasti per muovere la sonda vanno premuti con la finestra di runSofa in primo piano, non con
-    quella dell'endoscopio."""
+    quella dell'endoscopio.
+
+    Resa neurale (neural != None, vedi neural_render.py): l'immagine RGB non e' quella procedurale
+    ma quella generata dal modello broncho-sim2real a partire dalla profondita'. La vede l'agente
+    RL e compare nella finestra accanto a quella procedurale, per confronto. Con la GUI la rete gira
+    in un thread a parte (la finestra mostra l'ultima immagine pronta, con qualche passo di
+    ritardo); nel training invece ogni passo aspetta la sua immagine."""
 
     def __init__(self, camera, maze_dofs, probe_ctrl, resolution=64, show_window=False,
-                 preview_resolution=320, save_dir=None, save_every=0, *args, **kwargs):
+                 preview_resolution=320, save_dir=None, save_every=0, neural=None, *args, **kwargs):
         Sofa.Core.Controller.__init__(self, *args, **kwargs)
         self.camera = camera                # EndoscopeCamera
-        self.maze_dofs = maze_dofs          # MechanicalObject del labirinto (posizioni deformate)
+        self.neural = neural                # NeuralBronchoscopeRenderer, o None (solo procedurale)
+        self.last_neural = None             # ultima immagine neurale (risoluzione della rete)
+        self._neural_waiting_reported = False
+        self.maze_dofs = maze_dofs          # MechanicalObject delle pareti (tessuto deformato o
+                                            # superficie rigida, anche in movimento)
         self.probe_ctrl = probe_ctrl        # BronchoscopeController (posa della punta)
         self.resolution = resolution        # immagine dell'agente RL (quadrata)
         self.preview_resolution = preview_resolution
@@ -329,13 +339,46 @@ class EndoscopeController(Sofa.Core.Controller):
         self.camera.update_mesh(np.asarray(self.maze_dofs.position.value))
 
     def capture(self, resolution=None, sync=True):
-        """Scatta un'immagine dalla punta della sonda: (rgb uint8 (H, W, 3), depth float32 (H, W))."""
+        """Scatta un'immagine dalla punta della sonda: (rgb uint8 (H, W, 3), depth float32 (H, W)).
+        Con la resa neurale attiva, rgb e' l'immagine della rete (ridotta a `resolution`)."""
         if sync:
             self.sync_mesh()
-        rgb, depth = self.camera.render(self.probe_ctrl.get_tip_pose(), resolution or self.resolution)
-        if resolution is None or resolution == self.resolution:
+        resolution = resolution or self.resolution
+        pose = self.probe_ctrl.get_tip_pose()
+        rgb, depth = self.camera.render(pose, resolution)   # procedurale + profondita'
+        if self.neural is not None:
+            neural_rgb = self._neural_image(pose, resolution)
+            if neural_rgb is not None:
+                rgb = neural_rgb
+        if resolution == self.resolution:
             self.last_rgb, self.last_depth = rgb, depth
         return rgb, depth
+
+    def _neural_image(self, pose, resolution):
+        """Immagine della rete neurale alla risoluzione richiesta (None se non ancora pronta)."""
+        from neural_render import apply_circle, fisheye_valid_mask
+        size = self.neural.resolution
+        # la rete vuole la profondita' alla sua risoluzione (256 px): la telecamera la ricalcola
+        # a quella risoluzione (~1 ms), invece di ingrandire quella piccola dell'agente
+        _, depth = self.camera.render(pose, size)
+        valid = fisheye_valid_mask(depth, self.camera.optics.max_distance)
+        if self.neural.asynchronous:
+            self.neural.submit(depth, valid)     # non blocca: la rete lavora in un altro thread
+            image = self.neural.latest()
+            if image is None:
+                if not self._neural_waiting_reported:
+                    print("[endoscopio] rete neurale in preparazione: per ora immagine procedurale")
+                    self._neural_waiting_reported = True
+                return None
+        else:
+            image = self.neural.render(depth, valid)   # aspetta l'immagine (training)
+        image = apply_circle(image)   # stessi angoli neri dell'ottica fisheye procedurale
+        self.last_neural = image
+        if resolution == size:
+            return image
+        cv2 = self._import_cv2()
+        # INTER_AREA: riduzione che media i pixel (niente aliasing)
+        return cv2.resize(image, (resolution, resolution), interpolation=cv2.INTER_AREA)
 
     # --- Evento SOFA: fine di ogni passo -----------------------------------------
     def onAnimateEndEvent(self, event):
@@ -345,7 +388,8 @@ class EndoscopeController(Sofa.Core.Controller):
             return   # in training (headless) le immagini le chiede l'ambiente con capture()
 
         rgb, depth = self.capture()
-        preview, _ = self.capture(self.preview_resolution, sync=False)   # stessa geometria, piu' pixel
+        # anteprima procedurale ad alta risoluzione (stessa geometria, piu' pixel)
+        preview, _ = self.camera.render(self.probe_ctrl.get_tip_pose(), self.preview_resolution)
         panel = self._compose(preview, rgb, depth)
 
         if self.show_window:
@@ -359,20 +403,34 @@ class EndoscopeController(Sofa.Core.Controller):
         Restituisce un'immagine BGR (l'ordine dei canali che usa OpenCV)."""
         cv2 = self._import_cv2()
         size = preview.shape[0]
+        tiles = []   # (immagine BGR size x size, etichetta)
+        if self.neural is not None:
+            # immagine neurale ingrandita con interpolazione (e' gia' a 256 px); nera finche' la rete
+            # non ha prodotto la prima immagine (compilazione)
+            if self.last_neural is not None:
+                neural = cv2.resize(self.last_neural, (size, size), interpolation=cv2.INTER_LINEAR)
+                ms = f", {self.neural.last_time * 1000:.0f} ms" if self.neural.last_time else ""
+                label = f"neurale ({self.neural.steps} passi{ms})"
+            else:
+                neural, label = np.zeros((size, size, 3), np.uint8), "neurale (in preparazione)"
+            tiles.append((cv2.cvtColor(neural, cv2.COLOR_RGB2BGR), label))
+        tiles.append((cv2.cvtColor(preview, cv2.COLOR_RGB2BGR),
+                      "procedurale" if self.neural is not None else "anteprima"))
         # vista dell'agente ingrandita senza interpolazione: si vedono i pixel veri della rete
         agent = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_NEAREST)
+        tiles.append((cv2.cvtColor(agent, cv2.COLOR_RGB2BGR), f"agente {self.resolution}x{self.resolution}"))
         from endoscope_camera import depth_to_image
         d = depth_to_image(depth, self.camera.optics.max_distance)
         d = cv2.resize(cv2.applyColorMap(d, cv2.COLORMAP_INFERNO), (size, size),
                        interpolation=cv2.INTER_NEAREST)
-        panel = np.hstack([cv2.cvtColor(preview, cv2.COLOR_RGB2BGR),
-                           cv2.cvtColor(agent, cv2.COLOR_RGB2BGR), d])
-        for i, text in enumerate(("anteprima", f"agente {self.resolution}x{self.resolution}",
-                                  "profondita'")):
+        tiles.append((d, "profondita'"))
+
+        panel = np.hstack([tile for tile, _ in tiles])
+        for i, (_, text) in enumerate(tiles):
             cv2.putText(panel, text, (i * size + 8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (255, 255, 255), 1, cv2.LINE_AA)
         force, torque = self.probe_ctrl.get_coupling_load()
-        cv2.putText(panel, f"forza {force:6.2f} N", (2 * size + 8, size - 10),
+        cv2.putText(panel, f"forza {force:6.2f} N", ((len(tiles) - 1) * size + 8, size - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         return panel
 

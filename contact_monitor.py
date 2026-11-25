@@ -12,13 +12,13 @@ DA DOVE VENGONO LE FORZE
   (forza * passo temporale), per questo si divide per dt.
 
   Applicata ai centri delle sfere di collisione del broncoscopio si ottiene la forza di contatto
-  su ogni sfera. Per separare le pareti dei polmoni dal tubo introduttore (che lo strumento tocca
-  fuori dal paziente e che non va penalizzato) si guarda quali righe compaiono anche nella matrice
-  J della mesh dei polmoni: un contatto con le pareti coinvolge sia lo strumento sia il tessuto,
-  uno con il tubo solo lo strumento (il tubo non e' simulato).
+  su ogni sfera. Le sfere toccano solo le pareti (il tubo introduttore non e' un oggetto di
+  collisione, vedi bronchoscope.py), quindi tutte le righe di J sono contatti con le pareti. Si
+  usa la J dello strumento e non quella dei polmoni perche' funziona anche con i polmoni rigidi
+  (LUNG_RIGID), che non sono simulati e non hanno righe di vincolo.
 
 USO
-    monitor = ContactMonitor(solver, scope.col_dofs, wall_dofs, ...)   # in scene_maze.py
+    monitor = ContactMonitor(solver, scope.col_dofs, ...)              # in scene_maze.py
     info = monitor.last            # ContactInfo dell'ultimo passo (aggiornato a fine passo)
     penalty, terms = contact_penalty(info, **pesi)                     # in env.py
 """
@@ -40,7 +40,6 @@ class ContactInfo:
     forces: np.ndarray        # (S, 3) forza delle pareti su ogni sfera (normale + attrito)
     tip_zone: np.ndarray      # (S,) True per le sfere della parte distale (sezione di curvatura)
     spacing: float            # distanza tra le sfere (per convertire il numero di sfere in lunghezza)
-    introducer_force: float   # modulo della forza totale dei contatti con il tubo introduttore
     threshold: float = 1e-4   # [N] sotto questa forza una sfera non si considera "in contatto"
 
     @property
@@ -82,7 +81,7 @@ class ContactInfo:
     @classmethod
     def empty(cls, n_spheres, tip_zone, spacing):
         """Nessun contatto."""
-        return cls(np.zeros((n_spheres, 3)), tip_zone, spacing, 0.0)
+        return cls(np.zeros((n_spheres, 3)), tip_zone, spacing)
 
 
 # =============================================================================
@@ -93,18 +92,15 @@ class ContactMonitor(Sofa.Core.Controller):
 
     solver        BlockGaussSeidelConstraintSolver con computeConstraintForces=True
     scope_col     MechanicalObject Vec3d dei centri delle sfere di collisione dello strumento
-    wall_dofs     MechanicalObject Vec3d su cui agiscono i contatti dei polmoni (quello che porta i
-                  modelli di collisione; con CUDA e' la copia Vec3d della superficie)
     sphere_abscissa  (S,) ascissa di ogni sfera dalla base [m]
     tip_length    lunghezza della parte distale che conta come "punta" [m]
     label         OglLabel su cui scrivere il riassunto (None = niente testo a schermo)"""
 
-    def __init__(self, solver, scope_col, wall_dofs, sphere_abscissa, tip_length,
+    def __init__(self, solver, scope_col, sphere_abscissa, tip_length,
                  label=None, *args, **kwargs):
         Sofa.Core.Controller.__init__(self, *args, **kwargs)
         self.solver = solver
         self.scope_col = scope_col
-        self.wall_dofs = wall_dofs
         abscissa = np.asarray(sphere_abscissa, dtype=float)
         self.n_spheres = len(abscissa)
         self.tip_zone = abscissa >= abscissa[-1] - tip_length
@@ -135,23 +131,12 @@ class ContactMonitor(Sofa.Core.Controller):
         rows = J.shape[0]
         lam = np.pad(lam, (0, max(0, rows - lam.size)))[:rows]
 
-        # righe che coinvolgono anche le pareti dei polmoni -> contatti con le pareti
-        W = _constraint_matrix(self.wall_dofs)
-        wall_rows = np.zeros(rows, dtype=bool)
-        if W is not None and W.nnz:
-            used = np.unique(W.nonzero()[0])
-            wall_rows[used[used < rows]] = True
-
-        # forza sui punti = J^T * lambda / dt, separata per pareti e tubo introduttore.
-        # La matrice che arriva da SOFA ha solo le colonne fino all'ultimo punto coinvolto in
-        # un vincolo: si completa con zeri fino al numero di sfere
+        # forza sui punti = J^T * lambda / dt. La matrice che arriva da SOFA ha solo le colonne
+        # fino all'ultimo punto coinvolto in un vincolo: si completa con zeri fino al numero di sfere
         forces = np.zeros((self.n_spheres, 3))
-        wall = (J.T @ np.where(wall_rows, lam, 0.0)).reshape(-1, 3) / dt
+        wall = (J.T @ lam).reshape(-1, 3) / dt
         forces[:len(wall)] = wall[:self.n_spheres]
-        tube = (J.T @ np.where(wall_rows, 0.0, lam)).reshape(-1, 3) / dt
-        return ContactInfo(forces=forces, tip_zone=self.tip_zone,
-                           spacing=self.spacing,
-                           introducer_force=float(np.linalg.norm(tube, axis=1).sum()))
+        return ContactInfo(forces=forces, tip_zone=self.tip_zone, spacing=self.spacing)
 
 
 def _constraint_matrix(dofs):

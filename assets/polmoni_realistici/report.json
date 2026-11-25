@@ -1,0 +1,98 @@
+{
+  "n_punti": 113409,
+  "n_tetraedri": 553528,
+  "tetraedri_per_tag": {
+    "1 parenchima": {
+      "n": 254237,
+      "volume_mm3": 4088994.1130671008
+    },
+    "3 parete_bronchi_intrapolmonari": {
+      "n": 247634,
+      "volume_mm3": 26084.35184860868
+    },
+    "5 parete_trachea_bronchi_principali": {
+      "n": 51657,
+      "volume_mm3": 8165.8514668831485
+    }
+  },
+  "facce_per_tag": {
+    "1 esterno|parenchima": 5119,
+    "3 esterno|parete_bronchi_intrapolmonari": 2465,
+    "5 esterno|parete_trachea_bronchi_principali": 15573,
+    "13 parenchima|parete_bronchi_intrapolmonari": 86265,
+    "15 parenchima|parete_trachea_bronchi_principali": 2222,
+    "23 lume_bronchi_intrapolmonari|parete_bronchi_intrapolmonari": 65747,
+    "25 lume_bronchi_intrapolmonari|parete_trachea_bronchi_principali": 112,
+    "34 parete_bronchi_intrapolmonari|lume_trachea_bronchi_principali": 106,
+    "35 parete_bronchi_intrapolmonari|parete_trachea_bronchi_principali": 549,
+    "45 lume_trachea_bronchi_principali|parete_trachea_bronchi_principali": 16114
+  },
+  "angolo_diedro_min": 5.182001027613666,
+  "tetraedri_con_diedro_<5deg": 0,
+  "volume_min_mm3": 0.0023246715859104546,
+  "livello": "grossolano",
+  "labelmap": "../labelmap.nii.gz",
+  "criteri_mesh": {
+    "parenchima": {
+      "cella": 14.0,
+      "faccia": 12.0,
+      "distanza": 2.0
+    },
+    "lume_bronchi_intrapolmonari": {
+      "cella": 1.2,
+      "faccia": 1.2,
+      "distanza": 0.2
+    },
+    "parete_bronchi_intrapolmonari": {
+      "cella": 1.2,
+      "faccia": 1.2,
+      "distanza": 0.2
+    },
+    "lume_trachea_bronchi_principali": {
+      "cella": 3.0,
+      "faccia": 3.0,
+      "distanza": 0.3
+    },
+    "parete_trachea_bronchi_principali": {
+      "cella": 3.0,
+      "faccia": 3.0,
+      "distanza": 0.3
+    }
+  },
+  "parametri": {
+    "input": "mesh_ATM_001",
+    "outdir": "mesh_ATM_001/grossolano_cavita_new",
+    "level": "grossolano",
+    "size_parenchyma": null,
+    "facet_parenchyma": null,
+    "distance_parenchyma": null,
+    "size_airway": null,
+    "facet_airway": null,
+    "distance_airway": null,
+    "size_trachea": null,
+    "facet_trachea": null,
+    "distance_trachea": null,
+    "cavity": true,
+    "odt": false,
+    "mesher": null,
+    "hmax_parenchyma": null,
+    "hmax_airway": null,
+    "hmax_trachea": null,
+    "hausd_parenchyma": null,
+    "hausd_airway": null,
+    "hausd_trachea": null,
+    "hmin": 0.3,
+    "hgrad": 2.0,
+    "keep_ridges": false,
+    "nosurf": false,
+    "mmg": null
+  },
+  "legenda_celle": {
+    "1": "parenchima",
+    "2": "lume_bronchi_intrapolmonari",
+    "3": "parete_bronchi_intrapolmonari",
+    "4": "lume_trachea_bronchi_principali",
+    "5": "parete_trachea_bronchi_principali"
+  },
+  "legenda_facce": "tag = 10*a + b, a<b, 0 = esterno; normale uscente sul bordo, da a verso b sulle interfacce"
+}

@@ -1,0 +1,80 @@
+{
+  "n_punti": 87081,
+  "n_tetraedri": 437047,
+  "tetraedri_per_tag": {
+    "1 parenchima": {
+      "n": 211615,
+      "volume_mm3": 4090092.100459348
+    },
+    "3 parete_bronchi_intrapolmonari": {
+      "n": 202643,
+      "volume_mm3": 26225.716148725744
+    },
+    "5 parete_trachea_bronchi_principali": {
+      "n": 22789,
+      "volume_mm3": 16604.178348306024
+    }
+  },
+  "facce_per_tag": {
+    "1 esterno|parenchima": 4649,
+    "3 esterno|parete_bronchi_intrapolmonari": 1900,
+    "5 esterno|parete_trachea_bronchi_principali": 6705,
+    "13 parenchima|parete_bronchi_intrapolmonari": 72019,
+    "15 parenchima|parete_trachea_bronchi_principali": 1042,
+    "23 lume_bronchi_intrapolmonari|parete_bronchi_intrapolmonari": 53300,
+    "25 lume_bronchi_intrapolmonari|parete_trachea_bronchi_principali": 86,
+    "34 parete_bronchi_intrapolmonari|lume_trachea_bronchi_principali": 87,
+    "35 parete_bronchi_intrapolmonari|parete_trachea_bronchi_principali": 470,
+    "45 lume_trachea_bronchi_principali|parete_trachea_bronchi_principali": 6771
+  },
+  "angolo_diedro_min": 6.006082514331865,
+  "tetraedri_con_diedro_<5deg": 0,
+  "volume_min_mm3": 0.006173433186318835,
+  "livello": "grossolano",
+  "labelmap": "mesh_ATM_001/labelmap.nii.gz",
+  "criteri_mesh": {
+    "parenchima": {
+      "cella": 14.0,
+      "faccia": 12.0,
+      "distanza": 2.0
+    },
+    "vie_aeree": {
+      "ratio": 1.0,
+      "h_min": 1.2,
+      "h_max": 7.0
+    }
+  },
+  "parametri": {
+    "input": "mesh_ATM_001/labelmap.nii.gz",
+    "outdir": "mesh_ATM_001/grossolano_cavita",
+    "level": "grossolano",
+    "size_parenchyma": null,
+    "facet_parenchyma": null,
+    "distance_parenchyma": null,
+    "airway_ratio": null,
+    "airway_min": null,
+    "airway_max": null,
+    "cavity": true,
+    "odt": false,
+    "mesher": null,
+    "hmax_parenchyma": null,
+    "hmax_airway": null,
+    "hmax_trachea": null,
+    "hausd_parenchyma": null,
+    "hausd_airway": null,
+    "hausd_trachea": null,
+    "hmin": 0.3,
+    "hgrad": 2.0,
+    "keep_ridges": false,
+    "nosurf": false,
+    "mmg": null
+  },
+  "legenda_celle": {
+    "1": "parenchima",
+    "2": "lume_bronchi_intrapolmonari",
+    "3": "parete_bronchi_intrapolmonari",
+    "4": "lume_trachea_bronchi_principali",
+    "5": "parete_trachea_bronchi_principali"
+  },
+  "legenda_facce": "tag = 10*a + b, a<b, 0 = esterno; normale uscente sul bordo, da a verso b sulle interfacce"
+}

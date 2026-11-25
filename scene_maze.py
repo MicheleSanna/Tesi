@@ -9,6 +9,7 @@ import linux_keyboard
 import controller
 import bronchoscope
 import contact_monitor
+import lung_motion
 # =============================================================================
 # CONFIGURAZIONE - modifica qui
 # =============================================================================
@@ -23,10 +24,18 @@ import contact_monitor
 #   "polmoni_graded"  polmoni3.0_graded.msh  13982 nodi - fine vicino a trachea e bronchi
 #   "polmoni_coarse"  polmoni3.0_coarse.msh   7954 nodi - come graded ma piu' grossolana,
 #                                             due fondi di bronco accorciati di ~0.3 unita'
-MESH_VARIANT = "polmoni_graded"
+# Polmoni realistici da TC (polmoni_realistici/, vedi report.json):
+#   "polmoni_realistici"  mesh.msh  113409 nodi, 553528 tetraedri - dimensioni reali, tetraedri
+#                                   etichettati per tessuto (parenchima, bronchi, trachea)
+#   "polmoni_realistici_graded"  stessa TC e stesse etichette, 87081 nodi, 437047 tetraedri:
+#                                vie aeree meno fitte (lato 1.2-7 mm invece di 1.2 nei bronchi e
+#                                3 nella trachea), soprattutto trachea e bronchi principali
+MESH_VARIANT = "polmoni_realistici_graded"
 MESH_FILES = {"fine": "maze4.1.msh", "graded": "maze4.1_graded.msh", "coarse": "maze4.1_coarse.msh",
               "ultra": "maze_ultra_complex.msh", "polmoni": "polmoni3.0.msh",
-              "polmoni_graded": "polmoni3.0_graded.msh", "polmoni_coarse": "polmoni3.0_coarse.msh"}
+              "polmoni_graded": "polmoni3.0_graded.msh", "polmoni_coarse": "polmoni3.0_coarse.msh",
+              "polmoni_realistici": os.path.join("polmoni_realistici", "mesh.msh"),
+              "polmoni_realistici_graded": os.path.join("polmoni_realistici_graded", "mesh.msh")}
 # percorso relativo a questo script, cosi' la scena si carica anche se runSofa viene lanciato
 # da un'altra cartella
 MESH_FILE = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"), MESH_FILES[MESH_VARIANT])
@@ -40,7 +49,51 @@ UP_AXIS = 2                   # asse verticale: 2 = Z (default di Blender), 1 = 
 #   appena fuori dall'imboccatura (None = automatico, proporzionale alla dimensione della mesh)
 # SCOPE_LENGTH = lunghezza inseribile dello strumento: deve bastare a raggiungere il fondo del
 #   canale / dei bronchi (all'inizio e' tutta fuori, dentro il tubo introduttore)
-if os.path.basename(MESH_FILE).startswith("maze"):
+# Valori validi per tutte le mesh salvo dove il ramo della mesh li cambia:
+MESH_ALIGN_TRACHEA = False    # True = orienta e posiziona la mesh a partire dall'asse della trachea
+TISSUE_YOUNG_MODULUS = None   # {etichetta del tetraedro: modulo di Young [Pa]}; None = YOUNG_MODULUS ovunque
+TISSUE_GRAVITY = True         # peso del tessuto
+FIX_OUTER_SURFACE = False     # True = vincola la superficie esterna invece della "base" (FIX_BOTTOM_FRACTION)
+
+if MESH_VARIANT.startswith("polmoni_realistici"):
+    # Polmoni segmentati da una TC (report.json: caso ATM_001, probabilmente dal dataset ATM'22),
+    # in mm, nelle coordinate del paziente DICOM (LPS): +x = sinistra, +y = dietro, +z = verso la
+    # testa. Verificato sulla mesh: il polmone piu' grande (il destro) sta a -x, i punti piu' bassi
+    # (i recessi costofrenici, che sono posteriori) a +y, e la trachea scendendo va all'indietro.
+    # Al caricamento la mesh viene ruotata con l'asse della trachea lungo la direzione di
+    # inserimento della sonda (+Y della scena, come il canale del labirinto) e il davanti del
+    # paziente in alto (+Z): paziente supino, gravita' verso la schiena, alto dell'immagine
+    # dell'endoscopio = davanti. Poi viene traslata con l'imboccatura della trachea (il taglio
+    # della TC in cima) appena davanti alla punta del broncoscopio.
+    MESH_SCALE = 0.001                 # mm -> m
+    MESH_ROTATION_DEG = 0.0            # (l'orientamento lo da' MESH_ALIGN_TRACHEA)
+    MESH_UPSIDE_DOWN = False
+    MESH_ALIGN_TRACHEA = True
+    MESH_ANTERIOR = [0.0, -1.0, 0.0]   # direzione "davanti" del paziente nelle coordinate della mesh
+    TRACHEA_TAG = 5                    # etichetta dei tetraedri della parete di trachea e bronchi principali
+    TRACHEA_AXIS_LENGTH = 0.06         # [m] tratto di trachea usato per stimarne l'asse (carena a ~11 cm)
+    # Diametro della sonda 3 mm = broncoscopio ultrasottile (gli standard sono 5-6 mm); il lume
+    # della trachea qui e' largo ~17-20 mm. Con 3 mm restano validi i parametri dello strumento
+    # (rigidezze, cavi) tarati finora.
+    PROBE_RADIUS = 0.0015
+    PROBE_START = None                 # calcolata dall'imboccatura della trachea
+    SCOPE_LENGTH = 0.30                # [m] trachea ~11 cm + bronchi
+    # Etichette dei tetraedri (report.json, "legenda_celle"); il lume (2, 4) e' vuoto.
+    # Ordini di grandezza: parenchima pochi kPa, parete dei bronchi decine di kPa, trachea e
+    # bronchi principali (con gli anelli di cartilagine) molto piu' rigidi. Contrasti molto forti
+    # rallentano la convergenza del gradiente coniugato (LINEAR_SOLVER = "iterative").
+    TISSUE_NAMES = {1: "parenchima", 3: "parete bronchi intrapolmonari",
+                    5: "parete trachea e bronchi principali"}
+    TISSUE_YOUNG_MODULUS = {1: 5.0e3, 3: 5.0e4, 5: 5.0e5}
+    # La forma della TC e' gia' quella che il polmone ha sotto il proprio peso: aggiungere la
+    # gravita' lo farebbe "afflosciare" una seconda volta (con E = 5 kPa di vari mm).
+    TISSUE_GRAVITY = False
+    # Il polmone e' contenuto nella gabbia toracica (pleura) e la trachea nel mediastino: si
+    # vincola tutta la superficie esterna. Sono i triangoli marcati con etichetta < 10 nel file
+    # (report.json: tag = 10 * a + b con a = 0 = esterno).
+    FIX_OUTER_SURFACE = True
+    OUTER_FACE_TAGS = (1, 3, 5)
+elif os.path.basename(MESH_FILE).startswith("maze"):
     # maze4.1 e' un cubo normalizzato in [-1, 1]^3 con un canale interno a sezione quadrata
     # (lato 0.112 unita' mesh) che entra al centro della faccia -Y e procede verso +Y nel piano z = 0.
     # Con MESH_SCALE = 0.05 il cubo e' largo 10 cm e il canale 5.6 mm.
@@ -90,10 +143,28 @@ CONSTRAINT_SOLVER = "BlockGaussSeidel"
 CONSTRAINT_ITERATIONS = 500
 CONSTRAINT_TOLERANCE = 1e-6
 
-# Solutore del sistema lineare del labirinto:
+# Polmoni rigidi: True = niente materiale deformabile, le pareti sono una superficie di triangoli
+# che il broncoscopio tocca ma non sposta (molto piu' veloce, contatti esatti: cede solo lo
+# strumento). False = tessuto deformabile (FEM), con le impostazioni qui sotto.
+LUNG_RIGID = True
+# Movimento predeterminato dei polmoni rigidi (lung_motion.py): None = fermi. Altrimenti una
+# funzione (posizioni a riposo, SceneInfo) -> LungMotion, ad esempio un respiro di 1 cm ogni 4 s:
+#   LUNG_MOTION = lambda rest, info: lung_motion.Breathing(rest, info, amplitude=0.01, period=4.0)
+LUNG_MOTION = None
+# Cedevolezza della superficie dei polmoni rigidi: ogni nodo e' legato alla sua posizione (di
+# riposo o del movimento prescritto) da una molla indipendente, con rigidezza proporzionale
+# all'area di superficie che rappresenta. E' uno strato di contatto, non un tessuto: con 2.5e9
+# Pa/m una forza di 1 N su una sfera dello strumento affonda la parete di ~0.2 mm.
+# Serve: con pareti perfettamente rigide (None) i contatti sono vincoli "duri" e ridondanti
+# (ogni sfera tocca piu' triangoli), Gauss-Seidel non converge appena la punta si incastra
+# (in prova all'imbocco dei bronchi dopo la carena: ~100 contatti, forze di centinaia di N).
+# Con molle indipendenti la correzione UncoupledConstraintCorrection e' esatta.
+LUNG_WALL_STIFFNESS = 2.5e9   # [Pa/m] (pressione per metro di affondamento); None = rigide
+
+# Solutore del sistema lineare del labirinto (solo polmoni deformabili):
 #   "direct"    = SparseLDLSolver + GenericConstraintCorrection: esatto, contatti accurati, lento
 #   "iterative" = CGLinearSolver + UncoupledConstraintCorrection: approssimato, molto piu' veloce
-LINEAR_SOLVER = "iterative"
+LINEAR_SOLVER = "direct"
 CG_ITERATIONS = 50            # solo per "iterative": iterazioni massime del gradiente coniugato
 USE_MULTITHREADING = False     # versioni parallele (plugin MultiThreading) di FEM e collisioni
 
@@ -103,7 +174,7 @@ USE_MULTITHREADING = False     # versioni parallele (plugin MultiThreading) di F
 # Si puo' scegliere anche senza modificare il file: SOFA_USE_CUDA=auto|1|0 python main.py
 # Con CUDA restano su CPU collisioni, contatti, pressione esterna e sonda; conviene solo con
 # mesh grandi (decine di migliaia di nodi). Richiede LINEAR_SOLVER = "iterative".
-USE_CUDA =  True #os.environ.get("SOFA_USE_CUDA", "auto")
+USE_CUDA = False #os.environ.get("SOFA_USE_CUDA", "auto")
 print("CUDA: ", USE_CUDA)
 CUDA_CG_TOLERANCE = 1e-6      # in precisione singola la tolleranza 1e-9 del CG non si raggiunge
 
@@ -131,7 +202,7 @@ SCOPE_GRAVITY = False                 # peso dello strumento (trascurabile, vedi
 # Cavi tendinei (CableConstraint di SoftRobots)
 CABLE_WAYS = 4                # 2 = su/giu' (broncoscopio standard), 4 = anche sinistra/destra (robotico)
 MAX_BEND_DEG = 180.0          # curvatura con la leva a fondo corsa
-MAX_CABLE_FORCE = 20.0        # [N] tensione massima di un cavo (curvatura libera a 180 gradi: ~10 N)
+MAX_CABLE_FORCE = 4.0        # [N] tensione massima di un cavo (curvatura libera a 180 gradi: ~10 N)
 CABLE_SLACK_DEG = 10.0        # gioco della leva attorno al neutro (punta "molle" a leva neutra)
 
 # Mano dell'operatore: molla mano -> base dello strumento. Spinta massima = rigidezza * offset.
@@ -166,11 +237,35 @@ CAMERA_LIGHT_RANGE = None        # [m] distanza a cui una parete appare ben illu
 CAMERA_TEXTURE_SCALE = None      # [m] dimensione delle maglie dei vasi (None = 2 raggi sonda)
 CAMERA_NOISE = 0.01              # rumore del sensore (deviazione standard, luminosita' in [0, 1])
 CAMERA_SEED = 0                  # seme della texture dei vasi (cambiarlo = un altro "paziente")
+CAMERA_MOTTLE = 1.0              # macchie leggere della mucosa: 0 = colore uniforme, 1 = +-15% di
+                                 # luminosita' (macchie leggere, danno punti di riferimento)
+CAMERA_MOTTLE_SCALE = None       # [m] dimensione delle macchie (distanza tipica tra due macchie
+                                 # vicine; None = 1 raggio sonda). Piu' piccolo = macchie piu' fitte
+CAMERA_VESSELS = 0.0             # vasi sanguigni: 0 = assenti (come di solito nelle broncoscopie
+                                 # reali), 1 = rete di vasi ben visibile, valori intermedi = piu' tenui
+CAMERA_SPECULAR = 0.8            # intensita' dei riflessi della luce sulla mucosa bagnata (era 0.6)
 CAMERA_SHOW_WINDOW = True        # finestra OpenCV con anteprima, vista dell'agente e profondita'
 CAMERA_PREVIEW_RESOLUTION = 320  # [px] lato dell'anteprima ad alta risoluzione nella finestra
 CAMERA_SAVE_DIR = None           # cartella dove salvare le immagini (None = non salvare), es.
                                  # "endoscope_frames"; si usa anche se la finestra non si apre
 CAMERA_SAVE_EVERY = 1            # salva un'immagine ogni N passi
+
+# Come si ottiene l'immagine a colori dell'endoscopio:
+#   "procedural" = mucosa (macchie/vasi: CAMERA_MOTTLE/VESSELS) + luce sulla punta (endoscope_camera.py): ~1 ms per immagine
+#   "neural"     = rete neurale broncho-sim2real (neural_render.py): trasforma la profondita' in
+#                  un'immagine simile a una broncoscopia reale. ~0.27 s per immagine con 8 passi
+#                  (RTX 3050): nella GUI gira in parallelo alla simulazione, nel training la rallenta
+#                  molto. Richiede i pesi addestrati (best.pt, non ancora pubblicati dall'autore).
+CAMERA_RENDERER = "procedural"
+NEURAL_CHECKPOINT = "weights/random_weights.pt"   # percorso dei pesi (relativo a questa cartella o
+                                 # assoluto). Quello predefinito contiene pesi CASUALI (rumore
+                                 # colorato), creati con "python neural_render.py": sostituiscilo
+                                 # con best.pt quando disponibile
+NEURAL_RESOLUTION = 256          # [px] immagine generata dalla rete (addestrata a 256; multiplo di 16)
+NEURAL_STEPS = 8                 # passi di integrazione: 100 = qualita' piena (~6 s), 4-8 = veloce
+NEURAL_SOLVER = "euler"          # "euler" (1 valutazione per passo) o "heun" (2, piu' preciso)
+NEURAL_COMPILE = True            # torch.compile: -30% di tempo, ~1 minuto di compilazione la prima volta
+NEURAL_SEED = 0                  # seme del rumore iniziale (fisso: immagini coerenti nel tempo)
 
 
 def _cuda_device_available():
@@ -227,6 +322,42 @@ def create_keyboard():
     return None
 
 
+def tissue_young_modulus(mesh):
+    """Modulo di Young [Pa] di ogni tetraedro secondo TISSUE_YOUNG_MODULUS ed etichette della mesh
+    (array (M,)), oppure None se il materiale e' uniforme (YOUNG_MODULUS)."""
+    if TISSUE_YOUNG_MODULUS is None:
+        return None
+    if mesh.tet_tags is None:
+        raise RuntimeError("TISSUE_YOUNG_MODULUS richiede una mesh con i tetraedri etichettati")
+    missing = set(np.unique(mesh.tet_tags)) - set(TISSUE_YOUNG_MODULUS)
+    if missing:
+        raise RuntimeError(f"TISSUE_YOUNG_MODULUS non ha un valore per le etichette {sorted(missing)}")
+    lookup = np.zeros(max(TISSUE_YOUNG_MODULUS) + 1)
+    for tag, value in TISSUE_YOUNG_MODULUS.items():
+        lookup[tag] = value
+    return lookup[mesh.tet_tags]
+
+
+def align_trachea(mesh, insertion_axis, up):
+    """Ruota e trasla i punti della mesh in modo che l'asse della trachea coincida con la
+    direzione di inserimento della sonda (passando per l'origine) e il davanti del paziente
+    (MESH_ANTERIOR) sia in alto. Restituisce (punti, posizione dell'imboccatura sull'asse).
+
+    L'imboccatura e' il punto dell'asse all'altezza del primo nodo della trachea che si incontra
+    entrando (il taglio della TC in cima non e' perpendicolare all'asse, che e' inclinato)."""
+    origin, axis = mesh_utilities.trachea_axis(mesh.points, mesh.tets, mesh.tet_tags, TRACHEA_TAG,
+                                               up=up, length=TRACHEA_AXIS_LENGTH)
+    rotation = mesh_utilities.frame_rotation(axis, MESH_ANTERIOR, insertion_axis, up)
+    points = rotation.apply(mesh.points - origin)            # asse della trachea = insertion_axis
+    trachea_nodes = np.unique(mesh.tets[mesh.tet_tags == TRACHEA_TAG])
+    mouth_depth = float((points[trachea_nodes] @ insertion_axis).min())
+    tilt = math.degrees(math.acos(min(1.0, abs(axis @ np.asarray(up, dtype=float)))))
+    print(f"=== Trachea: asse inclinato di {tilt:.1f} gradi sulla verticale della mesh, "
+          f"imboccatura riportata all'origine ===")
+    points = points - insertion_axis * mouth_depth
+    return points, np.zeros(3)
+
+
 def scope_params(radius):
     """ScopeParams del broncoscopio a partire dalle impostazioni in cima al file."""
     return bronchoscope.ScopeParams(
@@ -241,8 +372,201 @@ def scope_params(radius):
         max_push_offset=HAND_MAX_PUSH_OFFSET, max_roll_offset_deg=HAND_MAX_ROLL_OFFSET_DEG)
 
 
+def add_deformable_lungs(root, mesh, points, tets, bb_min, size, with_visual):
+    """Tessuto deformabile (FEM a tetraedri) con la superficie che collide con lo strumento.
+    Restituisce (punti, triangoli di superficie, MechanicalObject) per la telecamera, che segue la
+    forma deformata leggendo le posizioni dal MechanicalObject."""
+    if FIX_OUTER_SURFACE:
+        if mesh.tri_tags is None:
+            raise RuntimeError("FIX_OUTER_SURFACE richiede i triangoli etichettati nel file della mesh")
+        fixed = np.unique(mesh.triangles[np.isin(mesh.tri_tags, OUTER_FACE_TAGS)])
+    else:
+        height = points[:, UP_AXIS]
+        fixed = np.where(height <= bb_min[UP_AXIS] + FIX_BOTTOM_FRACTION * size[UP_AXIS])[0]
+    if len(fixed) == 0:
+        raise RuntimeError("Nessun nodo da vincolare: aumenta FIX_BOTTOM_FRACTION o controlla UP_AXIS.")
+
+    mass = DENSITY * mesh_utilities.total_volume(points, tets)
+    young = tissue_young_modulus(mesh)
+
+    print(f"  polmoni deformabili: {len(fixed)} nodi vincolati")
+    if young is not None:
+        for tag, name in TISSUE_NAMES.items():
+            print(f"  tessuto {tag} {name}: {np.count_nonzero(mesh.tet_tags == tag)} tetraedri, "
+                  f"E = {TISSUE_YOUNG_MODULUS[tag]:g} Pa")
+    print(f"  massa: {mass:.4g} kg")
+
+    use_cuda = resolve_use_cuda()
+    print(f"=== FEM del labirinto su {'GPU (SofaCUDA, CudaVec3f)' if use_cuda else 'CPU (Vec3d)'} ===")
+    par = "Parallel" if USE_MULTITHREADING else ""
+
+    maze = root.addChild("Labirinto")
+    maze.addObject("EulerImplicitSolver", rayleighStiffness=0.1, rayleighMass=0.1)
+    if LINEAR_SOLVER == "direct":
+        maze.addObject("SparseLDLSolver", template="CompressedRowSparseMatrixMat3x3d")
+        maze.addObject("MetisOrderingMethod")  # riordino: fattorizzazione LDL molto piu' veloce
+    elif LINEAR_SOLVER == "iterative":
+        maze.addObject("CGLinearSolver", iterations=CG_ITERATIONS,
+                       tolerance=CUDA_CG_TOLERANCE if use_cuda else 1e-9, threshold=1e-12)
+    else:
+        raise ValueError(f"LINEAR_SOLVER sconosciuto: {LINEAR_SOLVER!r}")
+    maze.addObject("TetrahedronSetTopologyContainer", name="topo",
+                   position=points.tolist(), tetrahedra=tets.tolist())
+    maze.addObject("TetrahedronSetTopologyModifier")
+    # con CUDA massa, FEM, vincoli e correzione dei contatti prendono il template CudaVec3f
+    # dal MechanicalObject; il FEM su GPU non ha la variante Parallel (MultiThreading)
+    maze_dofs = maze.addObject("MechanicalObject", name="dofs",
+                               template="CudaVec3f" if use_cuda else "Vec3d", position=points.tolist())
+    maze.addObject("UniformMass", totalMass=mass)
+    maze.addObject(("" if use_cuda else par) + "TetrahedronFEMForceField", method="large",
+                   youngModulus=young.tolist() if young is not None else YOUNG_MODULUS,
+                   poissonRatio=POISSON_RATIO)
+    maze.addObject("FixedProjectiveConstraint", indices=fixed.tolist())
+    if LINEAR_SOLVER == "direct":
+        maze.addObject("GenericConstraintCorrection")
+    else:
+        # ogni nodo viene trattato come indipendente dagli altri, con una cedevolezza
+        # (spostamento per unita' di forza) stimata come 1 / (E * lunghezza media degli spigoli)
+        if young is None:
+            maze.addObject("UncoupledConstraintCorrection",
+                           defaultCompliance=1.0 / (YOUNG_MODULUS * mesh_utilities.mean_edge_length(points, tets)))
+        else:
+            # con tessuti diversi una cedevolezza unica sarebbe sbagliata di ordini di grandezza
+            # (la parete della trachea e' 100 volte piu' rigida del parenchima): si calcola nodo
+            # per nodo, con E medio e lunghezza media degli spigoli dei tetraedri attorno al nodo
+            node_young = mesh_utilities.nodal_values(len(points), tets, young)
+            node_edge = mesh_utilities.nodal_edge_length(points, tets)
+            maze.addObject("UncoupledConstraintCorrection",
+                           compliance=(1.0 / (node_young * node_edge)).tolist())
+
+    # superficie estratta dai tetraedri: usata per collisione e grafica
+    surf = maze.addChild("Superficie")
+    surf.addObject("TriangleSetTopologyContainer", name="topo")
+    surf.addObject("TriangleSetTopologyModifier")
+    surf.addObject("Tetra2TriangleTopologicalMapping", input="@../topo", output="@topo")
+    if use_cuda:
+        # collisioni su CPU: copia Vec3d dei nodi del labirinto (PointCollisionModel non esiste
+        # in CUDA); le forze di contatto tornano sulla GPU attraverso la mapping
+        surf.addObject("MechanicalObject", name="dofs", template="Vec3d")
+        surf.addObject("IdentityMapping", input="@../dofs", output="@dofs")
+    # Solo triangoli: lo strumento e' fatto di sfere, e il test sfera-triangolo usa gia' il punto
+    # del triangolo piu' vicino (anche su spigoli e vertici). Con anche LineCollisionModel e
+    # PointCollisionModel lo stesso contatto veniva creato fino a 3 volte: in prova, spingendo lo
+    # strumento contro la carena, 1500 vincoli in gran parte doppi, Gauss-Seidel che non
+    # convergeva e simulazione che divergeva.
+    surf.addObject("TriangleCollisionModel")
+    if with_visual:
+        # con CUDA il nodo ha gia' un MechanicalObject (uno solo per nodo): grafica in un figlio,
+        # mappata dalla copia Vec3d; senza CUDA resta qui, mappata dai nodi del labirinto
+        vis = surf.addChild("Visuale") if use_cuda else surf
+        vis.addObject("OglModel", name="ogl", color=[0.85, 0.35, 0.35, 0.35])  # semitrasparente
+        vis.addObject("IdentityMapping", input="@../dofs", output="@ogl")
+
+    # pressione uniforme sulla superficie esterna: i triangoli usano direttamente gli indici dei
+    # nodi del labirinto, quindi le forze agiscono sui dofs del nodo padre senza mapping
+    # (con la superficie esterna vincolata la pressione agirebbe su nodi fermi: non serve)
+    if EXTERNAL_PRESSURE and not FIX_OUTER_SURFACE:
+        outer, n_boundary = mesh_utilities.outer_surface_triangles(points, tets)
+        a, b, c = (points[outer[:, i]] for i in range(3))
+        area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1).sum()
+        print(f"  pressione esterna: {EXTERNAL_PRESSURE:g} Pa su {len(outer)} triangoli esterni "
+              f"(su {n_boundary} di superficie totale), area {area * 1e4:.1f} cm^2")
+        pressure = maze.addChild("Pressione")
+        pressure.addObject("TriangleSetTopologyContainer", name="topo",
+                           position=points.tolist(), triangles=outer.tolist())
+        if use_cuda:
+            # SurfacePressureForceField non esiste in CUDA: agisce su una copia Vec3d dei nodi
+            # (stessi indici, quindi i triangoli restano validi) collegata alla GPU dalla mapping
+            pressure.addObject("MechanicalObject", name="dofs", template="Vec3d")
+            pressure.addObject("IdentityMapping", input="@../dofs", output="@dofs")
+        # useTangentStiffness=False: la matrice resta simmetrica, come richiesto da CG e LDL
+        pressure.addObject("SurfacePressureForceField", pressure=EXTERNAL_PRESSURE,
+                           useTangentStiffness=False)
+    return points, mesh_utilities.boundary_triangles(tets, points), maze_dofs
+
+
+def add_rigid_lungs(root, points, tets, info, with_visual):
+    """Polmoni rigidi: solo la superficie di triangoli (pareti delle vie aeree ed esterno), senza
+    materiale. Nessun sistema lineare del tessuto da risolvere e nessuna approssimazione nella
+    risposta ai contatti.
+
+    Due varianti (LUNG_WALL_STIFFNESS):
+      - None: superficie perfettamente rigida (simulated=False), cede solo lo strumento;
+      - un valore: ogni nodo della superficie e' tenuto nella sua posizione da una molla
+        indipendente (RestShapeSpringsForceField), cosi' i contatti hanno una piccola cedevolezza
+        e il problema dei vincoli resta ben posto anche con lo strumento incastrato.
+    Con LUNG_MOTION la posizione a cui tornano i nodi segue un movimento prescritto
+    (lung_motion.py): la superficie (o, con le molle, il riferimento delle molle) viene spostata
+    a ogni passo da MotionController.
+
+    Restituisce (punti, triangoli, MechanicalObject) della superficie, per la telecamera."""
+    # triangoli di superficie con la normale verso il lume (il lato da cui arriva lo strumento);
+    # si tengono solo i nodi di superficie, rinumerati
+    tris = mesh_utilities.boundary_triangles(tets, points)
+    used, tris = np.unique(tris, return_inverse=True)
+    tris = tris.reshape(-1, 3)
+    surface = points[used]
+    motion = LUNG_MOTION(surface, info) if LUNG_MOTION is not None else None
+    compliant = LUNG_WALL_STIFFNESS is not None
+
+    lungs = root.addChild("Labirinto")
+    if compliant:
+        # sistema diagonale (molle indipendenti + massa ai nodi): il gradiente coniugato converge
+        # in pochissime iterazioni. Lo smorzamento evita che i nodi vibrino dopo un contatto.
+        lungs.addObject("EulerImplicitSolver", rayleighStiffness=0.1, rayleighMass=0.1)
+        lungs.addObject("CGLinearSolver", iterations=10, tolerance=1e-12, threshold=1e-15)
+    lungs.addObject("MeshTopology", name="topo", position=surface.tolist(), triangles=tris.tolist())
+    dofs = lungs.addObject("MechanicalObject", name="dofs", template="Vec3d",
+                           position=surface.tolist())
+
+    target = dofs                   # MechanicalObject che il movimento prescritto sposta
+    if compliant:
+        # rigidezza di ogni nodo = rigidezza per area * area di superficie del nodo (1/3 dell'area
+        # dei triangoli che lo usano): uguale per unita' di area anche dove la mesh e' piu' fitta
+        a, b, c = (surface[tris[:, i]] for i in range(3))
+        tri_area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+        node_area = np.zeros(len(surface))
+        for i in range(3):
+            np.add.at(node_area, tris[:, i], tri_area / 3.0)
+        node_stiffness = LUNG_WALL_STIFFNESS * np.maximum(node_area, 1e-12)
+        # massa piccola: con l'integrazione implicita la superficie risponde quasi staticamente
+        # (periodo proprio << dt), la massa serve solo a rendere il sistema invertibile
+        node_mass = 1e-3 * node_stiffness * DT ** 2
+        lungs.addObject("DiagonalMass", name="massa", vertexMass=node_mass.tolist())
+        if motion is not None:
+            # riferimento delle molle in un nodo a parte, senza dinamica: lo muove MotionController
+            rest = root.addChild("RiposoPolmoni")
+            target = rest.addObject("MechanicalObject", name="dofs", template="Vec3d",
+                                    position=surface.tolist())
+            lungs.addObject("RestShapeSpringsForceField", name="pareti", stiffness=node_stiffness.tolist(),
+                            external_rest_shape="@../RiposoPolmoni/dofs")
+        else:
+            lungs.addObject("RestShapeSpringsForceField", name="pareti", stiffness=node_stiffness.tolist())
+        # nodi indipendenti: la correzione disaccoppiata e' esatta. Cedevolezza = spostamento per
+        # unita' di forza della molla del nodo
+        lungs.addObject("UncoupledConstraintCorrection", compliance=(1.0 / node_stiffness).tolist())
+        lungs.addObject("TriangleCollisionModel")
+    else:
+        lungs.addObject("TriangleCollisionModel", moving=motion is not None, simulated=False)
+
+    if with_visual:
+        # grafica in un nodo figlio: anche OglModel e' uno "stato" e un nodo ne puo' avere uno
+        # solo (nello stesso nodo del MechanicalObject le molle e il movimento non agivano piu')
+        vis = lungs.addChild("Visuale")
+        vis.addObject("OglModel", name="ogl", position=surface.tolist(), triangles=tris.tolist(),
+                      color=[0.85, 0.35, 0.35, 0.35])
+        if compliant or motion is not None:
+            vis.addObject("IdentityMapping", input="@../dofs", output="@ogl")
+    if motion is not None:
+        root.addObject(lung_motion.MotionController(motion, target, name="LungMotion"))
+    print(f"  polmoni rigidi: {len(surface)} nodi e {len(tris)} triangoli di superficie, "
+          f"{'cedevolezza di contatto %g Pa/m' % LUNG_WALL_STIFFNESS if compliant else 'perfettamente rigidi'}, "
+          f"{'movimento ' + type(motion).__name__ if motion else 'fermi'}")
+    return surface, tris, dofs
+
+
 def createScene(root, with_visual=True, with_camera=None):
-    """Costruisce la scena: tessuto deformabile (labirinto o polmoni), broncoscopio a cavi con il
+    """Costruisce la scena: polmoni (o labirinto) rigidi o deformabili, broncoscopio a cavi con il
     suo tubo introduttore, controller dei comandi, misura dei contatti ed eventuale telecamera.
 
     with_camera: True / False = aggiungi / non aggiungere la telecamera endoscopica;
@@ -254,7 +578,14 @@ def createScene(root, with_visual=True, with_camera=None):
     up = np.zeros(3)
     up[UP_AXIS] = 1.0
 
-    points, tets = mesh_utilities.load_tet_mesh(MESH_FILE, MESH_SCALE)
+    mesh = mesh_utilities.load_labeled_tet_mesh(MESH_FILE, MESH_SCALE)
+    points, tets = mesh.points, mesh.tets
+    # orientamento della sonda all'inizio: entra lungo il suo asse +X, ruotato di
+    # PROBE_START_YAW_DEG attorno alla verticale
+    q0 = R.from_rotvec(up * math.radians(PROBE_START_YAW_DEG)).as_quat()
+    insertion_axis = R.from_quat(q0).apply([1.0, 0.0, 0.0])
+    if MESH_ALIGN_TRACHEA:
+        points, start = align_trachea(mesh, insertion_axis, up)
     if MESH_ROTATION_DEG:
         points = R.from_rotvec(up * math.radians(MESH_ROTATION_DEG)).apply(points)
     if MESH_UPSIDE_DOWN:
@@ -268,29 +599,19 @@ def createScene(root, with_visual=True, with_camera=None):
     trans_step = TRANSLATION_STEP or 0.5 * radius
     rot_step = math.radians(ROTATION_STEP_DEG)
 
-    if PROBE_START is None:
+    if MESH_ALIGN_TRACHEA:
+        start = start - insertion_axis * 2.0 * radius      # punta appena fuori dall'imboccatura
+    elif PROBE_START is None:
         start = (bb_min + bb_max) / 2.0
         start[0] = bb_min[0] - 2.0 * radius
     else:
         start = np.asarray(PROBE_START, dtype=float)
-    q0 = R.from_rotvec(up * math.radians(PROBE_START_YAW_DEG)).as_quat()
     start_pose = list(start) + list(q0)
 
-    height = points[:, UP_AXIS]
-    fixed = np.where(height <= bb_min[UP_AXIS] + FIX_BOTTOM_FRACTION * size[UP_AXIS])[0]
-    if len(fixed) == 0:
-        raise RuntimeError("Nessun nodo da vincolare: aumenta FIX_BOTTOM_FRACTION o controlla UP_AXIS.")
-
-    mass = DENSITY * mesh_utilities.total_volume(points, tets)
-
     print("=== Labirinto ===")
-    print(f"  nodi: {len(points)}  tetraedri: {len(tets)}  nodi vincolati: {len(fixed)}")
+    print(f"  nodi: {len(points)}  tetraedri: {len(tets)}")
     print(f"  bounding box min: {bb_min}  max: {bb_max}  (dimensioni {size})")
-    print(f"  massa: {mass:.4g} kg")
     print(f"=== Punta del broncoscopio all'inizio: {start}, avanzamento {trans_step * 1000:.2f} mm/passo ===")
-
-    use_cuda = resolve_use_cuda()
-    print(f"=== FEM del labirinto su {'GPU (SofaCUDA, CudaVec3f)' if use_cuda else 'CPU (Vec3d)'} ===")
 
     # --- Root: plugin, loop, contatti --------------------------------------------
     plugins = [
@@ -340,7 +661,7 @@ def createScene(root, with_visual=True, with_camera=None):
                                          selectContrastingColor=True))
 
     root.dt = DT
-    root.gravity = list(-9.81 * up)
+    root.gravity = list(-9.81 * up) if TISSUE_GRAVITY else [0.0, 0.0, 0.0]
 
     root.addObject("FreeMotionAnimationLoop")
     # computeConstraintForces: espone le forze dei vincoli (contatti e cavi), che servono a
@@ -358,80 +679,14 @@ def createScene(root, with_visual=True, with_camera=None):
     root.addObject("CollisionResponse",
                    response="FrictionContactConstraint", responseParams=f"mu={FRICTION}")
 
-    # --- Labirinto deformabile ---------------------------------------------------
-    maze = root.addChild("Labirinto")
-    maze.addObject("EulerImplicitSolver", rayleighStiffness=0.1, rayleighMass=0.1)
-    if LINEAR_SOLVER == "direct":
-        maze.addObject("SparseLDLSolver", template="CompressedRowSparseMatrixMat3x3d")
-        maze.addObject("MetisOrderingMethod")  # riordino: fattorizzazione LDL molto piu' veloce
-    elif LINEAR_SOLVER == "iterative":
-        maze.addObject("CGLinearSolver", iterations=CG_ITERATIONS,
-                       tolerance=CUDA_CG_TOLERANCE if use_cuda else 1e-9, threshold=1e-12)
+    # --- Polmoni (o labirinto) ------------------------------------------------------
+    if LUNG_RIGID:
+        info = lung_motion.SceneInfo(mouth=np.asarray(start, dtype=float),
+                                     axis=insertion_axis, up=up)
+        wall_points, wall_tris, wall_dofs = add_rigid_lungs(root, points, tets, info, with_visual)
     else:
-        raise ValueError(f"LINEAR_SOLVER sconosciuto: {LINEAR_SOLVER!r}")
-    maze.addObject("TetrahedronSetTopologyContainer", name="topo",
-                   position=points.tolist(), tetrahedra=tets.tolist())
-    maze.addObject("TetrahedronSetTopologyModifier")
-    # con CUDA massa, FEM, vincoli e correzione dei contatti prendono il template CudaVec3f
-    # dal MechanicalObject; il FEM su GPU non ha la variante Parallel (MultiThreading)
-    maze_dofs = maze.addObject("MechanicalObject", name="dofs",
-                               template="CudaVec3f" if use_cuda else "Vec3d", position=points.tolist())
-    maze.addObject("UniformMass", totalMass=mass)
-    maze.addObject(("" if use_cuda else par) + "TetrahedronFEMForceField", method="large",
-                   youngModulus=YOUNG_MODULUS, poissonRatio=POISSON_RATIO)
-    maze.addObject("FixedProjectiveConstraint", indices=fixed.tolist())
-    if LINEAR_SOLVER == "direct":
-        maze.addObject("GenericConstraintCorrection")
-    else:
-        # ogni nodo viene trattato come indipendente dagli altri, con una cedevolezza
-        # (spostamento per unita' di forza) stimata come 1 / (E * lunghezza media degli spigoli)
-        maze.addObject("UncoupledConstraintCorrection",
-                       defaultCompliance=1.0 / (YOUNG_MODULUS * mesh_utilities.mean_edge_length(points, tets)))
-
-    # superficie estratta dai tetraedri: usata per collisione e grafica
-    surf = maze.addChild("Superficie")
-    surf.addObject("TriangleSetTopologyContainer", name="topo")
-    surf.addObject("TriangleSetTopologyModifier")
-    surf.addObject("Tetra2TriangleTopologicalMapping", input="@../topo", output="@topo")
-    if use_cuda:
-        # collisioni su CPU: copia Vec3d dei nodi del labirinto (PointCollisionModel non esiste
-        # in CUDA); le forze di contatto tornano sulla GPU attraverso la mapping
-        surf.addObject("MechanicalObject", name="dofs", template="Vec3d")
-        surf.addObject("IdentityMapping", input="@../dofs", output="@dofs")
-    # Solo triangoli: lo strumento e' fatto di sfere, e il test sfera-triangolo usa gia' il punto
-    # del triangolo piu' vicino (anche su spigoli e vertici). Con anche LineCollisionModel e
-    # PointCollisionModel lo stesso contatto veniva creato fino a 3 volte: in prova, spingendo lo
-    # strumento contro la carena, 1500 vincoli in gran parte doppi, Gauss-Seidel che non
-    # convergeva e simulazione che divergeva.
-    surf.addObject("TriangleCollisionModel")
-    # MechanicalObject su cui agiscono i contatti con il tessuto (per ContactMonitor)
-    wall_dofs = surf.getObject("dofs") if use_cuda else maze_dofs
-    if with_visual:
-        # con CUDA il nodo ha gia' un MechanicalObject (uno solo per nodo): grafica in un figlio,
-        # mappata dalla copia Vec3d; senza CUDA resta qui, mappata dai nodi del labirinto
-        vis = surf.addChild("Visuale") if use_cuda else surf
-        vis.addObject("OglModel", name="ogl", color=[0.85, 0.35, 0.35, 0.35])  # semitrasparente
-        vis.addObject("IdentityMapping", input="@../dofs", output="@ogl")
-
-    # pressione uniforme sulla superficie esterna: i triangoli usano direttamente gli indici dei
-    # nodi del labirinto, quindi le forze agiscono sui dofs del nodo padre senza mapping
-    if EXTERNAL_PRESSURE:
-        outer, n_boundary = mesh_utilities.outer_surface_triangles(points, tets)
-        a, b, c = (points[outer[:, i]] for i in range(3))
-        area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1).sum()
-        print(f"  pressione esterna: {EXTERNAL_PRESSURE:g} Pa su {len(outer)} triangoli esterni "
-              f"(su {n_boundary} di superficie totale), area {area * 1e4:.1f} cm^2")
-        pressure = maze.addChild("Pressione")
-        pressure.addObject("TriangleSetTopologyContainer", name="topo",
-                           position=points.tolist(), triangles=outer.tolist())
-        if use_cuda:
-            # SurfacePressureForceField non esiste in CUDA: agisce su una copia Vec3d dei nodi
-            # (stessi indici, quindi i triangoli restano validi) collegata alla GPU dalla mapping
-            pressure.addObject("MechanicalObject", name="dofs", template="Vec3d")
-            pressure.addObject("IdentityMapping", input="@../dofs", output="@dofs")
-        # useTangentStiffness=False: la matrice resta simmetrica, come richiesto da CG e LDL
-        pressure.addObject("SurfacePressureForceField", pressure=EXTERNAL_PRESSURE,
-                           useTangentStiffness=False)
+        wall_points, wall_tris, wall_dofs = add_deformable_lungs(root, mesh, points, tets, bb_min,
+                                                                 size, with_visual)
 
     # --- Broncoscopio ------------------------------------------------------------------
     # strumento + mano + tubo introduttore (bronchoscope.py); la punta parte in "start" e
@@ -451,7 +706,7 @@ def createScene(root, with_visual=True, with_camera=None):
 
     # misura dei contatti strumento-pareti a fine passo (per il reward e per il testo a schermo)
     root.addObject(contact_monitor.ContactMonitor(
-        constraint_solver, scope.col_dofs, wall_dofs, scope.geometry.sphere_abscissa,
+        constraint_solver, scope.col_dofs, scope.geometry.sphere_abscissa,
         CONTACT_TIP_LENGTH or SCOPE_BENDING_LENGTH,
         label=labels[4] if labels else None, name="ContactMonitor"))
 
@@ -461,19 +716,42 @@ def createScene(root, with_visual=True, with_camera=None):
         # la telecamera vede tutti i triangoli di superficie (pareti del canale ed esterno),
         # orientati con la normale verso il lume
         camera = endoscope_camera.EndoscopeCamera(
-            points, mesh_utilities.boundary_triangles(tets, points),
+            wall_points, wall_tris,
             fov_deg=CAMERA_FOV_DEG,
             light_range=CAMERA_LIGHT_RANGE or 4.0 * radius,
             texture_scale=CAMERA_TEXTURE_SCALE or 2.0 * radius,
             max_distance=diag,          # oltre la diagonale della mesh non c'e' niente da vedere
             lens_offset=radius,         # la posa e' il centro dell'ultima sfera: lente sulla sua faccia
+            mottle=CAMERA_MOTTLE, mottle_scale=CAMERA_MOTTLE_SCALE or radius,
+            vessels=CAMERA_VESSELS, specular=CAMERA_SPECULAR,
             noise=CAMERA_NOISE, seed=CAMERA_SEED)
         print(f"=== Endoscopio: {CAMERA_RESOLUTION}x{CAMERA_RESOLUTION} px, campo visivo "
-              f"{CAMERA_FOV_DEG:g} gradi, raycasting su {camera.device} ===")
+              f"{CAMERA_FOV_DEG:g} gradi, raycasting su {camera.device}, resa {CAMERA_RENDERER} ===")
+        neural = None
+        if CAMERA_RENDERER == "neural":
+            import neural_render   # import qui: torch e la rete servono solo con la resa neurale
+            checkpoint = NEURAL_CHECKPOINT
+            if checkpoint and not os.path.isabs(checkpoint):
+                checkpoint = os.path.join(os.path.dirname(os.path.abspath(__file__)), checkpoint)
+            # con la GUI la rete gira in un thread a parte (la simulazione non la aspetta);
+            # nel training ogni passo aspetta la sua immagine
+            try:
+                neural = neural_render.NeuralBronchoscopeRenderer(
+                    checkpoint, resolution=NEURAL_RESOLUTION, steps=NEURAL_STEPS, solver=NEURAL_SOLVER,
+                    seed=NEURAL_SEED, compile=NEURAL_COMPILE, asynchronous=with_visual)
+            except (FileNotFoundError, ValueError) as error:
+                if not with_visual:
+                    raise   # training: meglio fermarsi che addestrare su immagini diverse da quelle volute
+                # GUI: la scena si carica comunque, con la resa procedurale
+                print("\n" + "!" * 100 + f"\n[endoscopio] resa neurale NON disponibile: {error}\n"
+                      "[endoscopio] uso la resa procedurale\n" + "!" * 100 + "\n")
+        elif CAMERA_RENDERER != "procedural":
+            raise ValueError(f"CAMERA_RENDERER sconosciuto: {CAMERA_RENDERER!r} "
+                             "(usa 'procedural' o 'neural')")
         root.addObject(controller.EndoscopeController(
-            camera, maze_dofs, probe_ctrl, resolution=CAMERA_RESOLUTION,
+            camera, wall_dofs, probe_ctrl, resolution=CAMERA_RESOLUTION,
             show_window=with_visual and CAMERA_SHOW_WINDOW,
             preview_resolution=CAMERA_PREVIEW_RESOLUTION,
             save_dir=CAMERA_SAVE_DIR, save_every=CAMERA_SAVE_EVERY,
-            name="EndoscopeController"))
+            neural=neural, name="EndoscopeController"))
     return root
